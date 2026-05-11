@@ -195,6 +195,97 @@ After all, run:
 
 When the script finishes, the generated corpus will be saved to examples/generated_corpus/{graph_name}_template_corpus.json.
 
+#### Convert Schema to Oracle SQL Property Graphs (SQL/PGQ)
+
+`python ./examples/tugraph_to_oracle_sqlpgq.py`
+
+This example converts a framework/TuGraph-style schema JSON into Oracle SQL/PGQ artifacts:
+
+- relational vertex and edge table DDL
+- `CREATE OR REPLACE PROPERTY GRAPH` DDL
+- Oracle artifact manifest JSON
+- `python-oracledb` CSV loader template
+
+Oracle SQL/PGQ query generation and validation are available through:
+
+```python
+from app.core.generator.corpus_generator import CorpusGenerator
+from app.core.llm.llm_client import LlmClient
+from app.core.validator.validator import CorpusValidator
+from app.impl.oracle_sqlpgq.translator.oracle_sqlpgq_query_translator import (
+    OracleSqlPgqQueryTranslator,
+)
+
+llm_client = LlmClient(model="qwen3-coder-plus-2025-07-22")
+translator = OracleSqlPgqQueryTranslator(graph_name="TEXT2GQL_GRAPH")
+validator = CorpusValidator(backend="oracle_sqlpgq", db_client_params={
+    "dsn": "localhost:1521/FREEPDB1",
+    "user": "graph_user",
+    "password": "password",
+})
+generator = CorpusGenerator(llm_client, query_language="oracle_sqlpgq")
+```
+
+To create and populate the example Oracle SQL/PGQ graph:
+
+```bash
+export ORACLE_DSN='localhost:1521/FREEPDB1'
+export ORACLE_USER='graph_user'
+export ORACLE_PASSWORD='password'
+python3 examples/setup_oracle_sqlpgq_example_db.py
+```
+
+To generate and validate an Oracle SQL/PGQ corpus with the configured LLM:
+
+```bash
+export LLM_PLATFORM='dashscope'  # or openai
+export DASHSCOPE_API_KEY='...'
+python3 examples/generate_corpus_oracle_sqlpgq.py
+```
+
+#### Translate Cypher to Oracle SQL/PGQ
+
+`examples/cypher2oracle_sqlpgq.py` translates supported Cypher queries into Oracle SQL/PGQ `GRAPH_TABLE` queries by reusing the framework's intermediate representation:
+
+```text
+Cypher query -> Cypher grammar check -> Graph-IL -> Oracle SQL/PGQ translator -> GRAPH_TABLE query
+```
+
+For one query:
+
+```bash
+poetry run python examples/cypher2oracle_sqlpgq.py \
+  --query "MATCH (p:PERSON)-[a:ACTED_IN]->(m:MOVIE) RETURN m.title AS movie_title" \
+  --graph-name TEXT2GQL_GRAPH
+```
+
+For a large query pool, provide a JSON file containing a plain list of Cypher query strings:
+
+```json
+[
+  "MATCH (p:PERSON) RETURN p.name AS person_name",
+  "MATCH (p:PERSON)-[a:ACTED_IN]->(m:MOVIE) WHERE p.name = 'Tom Hanks' RETURN m.title AS movie_title"
+]
+```
+
+Then run:
+
+```bash
+poetry run python examples/cypher2oracle_sqlpgq.py \
+  --input examples/cypher_queries.json \
+  --output examples/generated_corpus/cypher_to_oracle_sqlpgq.json \
+  --graph-name TEXT2GQL_GRAPH
+```
+
+The output contains the source query, translated Oracle SQL/PGQ query, and a category:
+
+- `Graph-IL Translatable`: the query was translated successfully.
+- `Not Comply with OpenCypher`: the source query failed the current Cypher grammar check.
+- `Graph-IL Not Support`: the query parsed as Cypher but is outside the current Graph-IL visitor subset.
+- `No Related Oracle SQL/PGQ Standard`: translation completed but failed SQL/PGQ validation.
+
+The current Graph-IL subset covers basic `MATCH` paths, simple property comparisons, `RETURN` items, aliases, aggregates, `ORDER BY`, `SKIP`, `LIMIT`, `DISTINCT`, and relationship hop ranges. More advanced Cypher features require extending the IR and visitor support first.
+
 #### Cypher2GQL
 
 `python ./examples/cypher2gql.py`

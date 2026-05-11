@@ -24,6 +24,7 @@ class EdgePattern:
 class PathPattern:
     node_pattern_list: List[NodePattern]
     edge_pattern_list: List[EdgePattern]
+    path_variable: str = ""
 
 
 class MatchClause(Clause):
