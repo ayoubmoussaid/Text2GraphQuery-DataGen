@@ -27,6 +27,9 @@ def cypher2oracle_sqlpgq(
     node_label_map: dict[str, list[str]] | None = None,
     edge_label_map: dict[str, list[str]] | None = None,
     property_type_map: dict[str, dict[str, str]] | None = None,
+    node_primary_key_map: dict[str, str] | None = None,
+    edge_primary_key_map: dict[str, str] | None = None,
+    strict_property_validation: bool = False,
 ) -> tuple[str, str]:
     """Translate a supported Cypher query into Oracle SQL/PGQ GRAPH_TABLE syntax."""
 
@@ -36,6 +39,9 @@ def cypher2oracle_sqlpgq(
         node_label_map=node_label_map,
         edge_label_map=edge_label_map,
         property_type_map=property_type_map,
+        node_primary_key_map=node_primary_key_map,
+        edge_primary_key_map=edge_primary_key_map,
+        strict_property_validation=strict_property_validation,
     )
     if union_query is not None:
         return union_query
@@ -47,6 +53,9 @@ def cypher2oracle_sqlpgq(
         node_label_map=node_label_map,
         edge_label_map=edge_label_map,
         property_type_map=property_type_map,
+        node_primary_key_map=node_primary_key_map,
+        edge_primary_key_map=edge_primary_key_map,
+        strict_property_validation=strict_property_validation,
     )
 
     if not cypher_translator.grammar_check(query):
@@ -74,6 +83,9 @@ def _translate_union_query(
     node_label_map: dict[str, list[str]] | None,
     edge_label_map: dict[str, list[str]] | None,
     property_type_map: dict[str, dict[str, str]] | None,
+    node_primary_key_map: dict[str, str] | None,
+    edge_primary_key_map: dict[str, str] | None,
+    strict_property_validation: bool,
 ) -> tuple[str, str] | None:
     branches, operators = _split_top_level_unions(query)
     if len(branches) == 1:
@@ -88,6 +100,9 @@ def _translate_union_query(
             node_label_map=node_label_map,
             edge_label_map=edge_label_map,
             property_type_map=property_type_map,
+            node_primary_key_map=node_primary_key_map,
+            edge_primary_key_map=edge_primary_key_map,
+            strict_property_validation=strict_property_validation,
         )
         if category != "Graph-IL Translatable":
             return "Unable to Translate to Oracle SQL/PGQ", category

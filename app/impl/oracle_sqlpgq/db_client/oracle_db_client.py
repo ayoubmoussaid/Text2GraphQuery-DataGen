@@ -41,19 +41,27 @@ class OracleDBClient(DB_Client):
             print(f"Failed to create OracleDBClient: {exc}")
             return None
 
-    def execute_query(self, query: str) -> QueryResult:
+    def execute_query(
+        self,
+        query: str,
+        fetch_limit: int = 0,
+        call_timeout_ms: int = 0,
+    ) -> QueryResult:
         if not self.connection:
             return QueryResult(
                 status_code=QueryStatus.SERVER_ERROR,
                 error="Oracle connection is not initialized or connection failed.",
             )
 
+        previous_call_timeout = getattr(self.connection, "call_timeout", 0)
         try:
+            if call_timeout_ms > 0:
+                self.connection.call_timeout = call_timeout_ms
             with self.connection.cursor() as cursor:
                 cursor.execute(query)
                 if cursor.description:
                     columns = [col[0] for col in cursor.description]
-                    rows = cursor.fetchall()
+                    rows = cursor.fetchmany(fetch_limit) if fetch_limit > 0 else cursor.fetchall()
                     data = [dict(zip(columns, row, strict=False)) for row in rows]
                     if not data:
                         return QueryResult(status_code=QueryStatus.NO_RECORD, data=[])
@@ -70,6 +78,9 @@ class OracleDBClient(DB_Client):
                 else QueryStatus.SERVER_ERROR
             )
             return QueryResult(status_code=status_code, error=error)
+        finally:
+            if call_timeout_ms > 0 and self.connection:
+                self.connection.call_timeout = previous_call_timeout
 
     def execute_script(self, script: str) -> List[QueryResult]:
         return [self.execute_query(statement) for statement in split_sql_statements(script)]

@@ -61,6 +61,7 @@ def main() -> None:
                 print(f"[skip] {unit.split}/{unit.database}")
                 continue
         try:
+            print(f"[start] {unit.split}/{unit.database}", flush=True)
             summary, samples = process_unit(unit, output_root, args)
             global_summaries.append(summary)
             unsupported_samples.extend(samples)
@@ -88,6 +89,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-queries", type=int, default=0)
     parser.add_argument("--keep-db-on-failure", action="store_true")
     parser.add_argument("--skip-live-validation", action="store_true")
+    parser.add_argument(
+        "--oracle-validation-timeout-ms",
+        type=int,
+        default=int(os.environ.get("ORACLE_VALIDATION_TIMEOUT_MS", "60000")),
+        help="Oracle timeout for each translated query validation call. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--oracle-validation-fetch-limit",
+        type=int,
+        default=int(os.environ.get("ORACLE_VALIDATION_FETCH_LIMIT", "1")),
+        help="Rows fetched for each translated query validation call. Use 0 to fetch all.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     return parser.parse_args()
@@ -112,6 +125,8 @@ def process_unit(
     node_label_map: Dict[str, List[str]] = {}
     edge_label_map: Dict[str, List[str]] = {}
     property_type_map: Dict[str, Dict[str, str]] = {}
+    node_primary_key_map: Dict[str, str] = {}
+    edge_primary_key_map: Dict[str, str] = {}
 
     enriched: List[Dict[str, Any]] = []
     unsupported_samples: List[Dict[str, Any]] = []
@@ -129,6 +144,8 @@ def process_unit(
             node_label_map = loader.node_label_map()
             edge_label_map = loader.edge_label_map()
             property_type_map = loader.property_type_map()
+            node_primary_key_map = loader.node_primary_key_map()
+            edge_primary_key_map = loader.edge_primary_key_map()
 
         for index, record in enumerate(records):
             enriched_record = translate_record(
@@ -138,6 +155,10 @@ def process_unit(
                 node_label_map=node_label_map,
                 edge_label_map=edge_label_map,
                 property_type_map=property_type_map,
+                node_primary_key_map=node_primary_key_map,
+                edge_primary_key_map=edge_primary_key_map,
+                validation_timeout_ms=args.oracle_validation_timeout_ms,
+                validation_fetch_limit=args.oracle_validation_fetch_limit,
             )
             enriched_record["oracle_dataset_meta"] = {
                 "split": unit.split,
@@ -198,6 +219,10 @@ def translate_record(
     node_label_map: Dict[str, List[str]] | None = None,
     edge_label_map: Dict[str, List[str]] | None = None,
     property_type_map: Dict[str, Dict[str, str]] | None = None,
+    node_primary_key_map: Dict[str, str] | None = None,
+    edge_primary_key_map: Dict[str, str] | None = None,
+    validation_timeout_ms: int = 0,
+    validation_fetch_limit: int = 0,
 ) -> Dict[str, Any]:
     output = dict(record)
     query_field, query = source_query(record)
@@ -226,6 +251,9 @@ def translate_record(
         node_label_map=node_label_map,
         edge_label_map=edge_label_map,
         property_type_map=property_type_map,
+        node_primary_key_map=node_primary_key_map,
+        edge_primary_key_map=edge_primary_key_map,
+        strict_property_validation=bool(property_type_map),
     )
     if category != "Graph-IL Translatable":
         output.update(_status(None, category, "unsupported", translated))
@@ -234,7 +262,11 @@ def translate_record(
     validation_status = "syntax_ok"
     error = ""
     if client is not None:
-        result = client.execute_query(translated)
+        result = client.execute_query(
+            translated,
+            fetch_limit=validation_fetch_limit,
+            call_timeout_ms=validation_timeout_ms,
+        )
         if result.status_code == QueryStatus.SUCCESS:
             validation_status = "success"
         elif result.status_code == QueryStatus.NO_RECORD:

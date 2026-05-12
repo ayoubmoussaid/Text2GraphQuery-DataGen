@@ -44,8 +44,24 @@ class DatasetOracleLoader:
         mapping: Dict[str, Dict[str, str]] = {}
         for item in self.manifest["vertices"] + self.manifest["edges"]:
             mapping.setdefault(item["label"], {})
+            mapping.setdefault(item.get("graph_label", item["label"]), {})
             for column in item["columns"]:
                 mapping[item["label"]][column["name"]] = column["type"]
+                mapping[item.get("graph_label", item["label"])][column["name"]] = column["type"]
+        return mapping
+
+    def node_primary_key_map(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for vertex in self.manifest["vertices"]:
+            mapping[vertex["label"]] = vertex["primary"]
+            mapping[vertex.get("graph_label", vertex["label"])] = vertex["primary"]
+        return mapping
+
+    def edge_primary_key_map(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for edge in self.manifest["edges"]:
+            mapping[edge["label"]] = edge["primary"]
+            mapping[edge.get("graph_label", edge["label"])] = edge["primary"]
         return mapping
 
     def cleanup(self, ignore_errors: bool = False) -> None:

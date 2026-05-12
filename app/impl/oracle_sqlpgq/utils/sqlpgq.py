@@ -160,7 +160,7 @@ def is_balanced_sql(text: str) -> bool:
 
 def validate_graph_table_query(query: str) -> bool:
     normalized = " ".join(str(query or "").strip().split()).upper()
-    if not normalized.startswith("SELECT "):
+    if not (normalized.startswith("SELECT ") or normalized.startswith("WITH ")):
         return False
     required_tokens = ["FROM GRAPH_TABLE", " MATCH ", " COLUMNS "]
     return all(token in normalized for token in required_tokens) and is_balanced_sql(query)
