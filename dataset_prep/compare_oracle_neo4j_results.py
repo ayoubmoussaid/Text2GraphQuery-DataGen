@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -114,7 +115,7 @@ class DatasetNeo4jLoader:
                     else query
                 )
                 result = session.run(executable)
-                return "success", result.data(), ""
+                return "success", [dict(record) for record in result], ""
         except Exception as exc:
             error = str(exc)
             status = "client_error" if "syntax" in error.lower() else "server_error"
@@ -400,6 +401,16 @@ def compare_unit(
                 summary["skipped"] += 1
                 increment(summary["skip_reasons"], skip_reason)
                 continue
+            cypher = (
+                record.get("oracle_source_query")
+                or record.get("initial_cypher")
+                or record.get("cypher")
+                or ""
+            )
+            if is_nondeterministic_limit_without_order(cypher):
+                summary["skipped"] += 1
+                increment(summary["skip_reasons"], "nondeterministic_limit_without_order")
+                continue
             summary["considered"] += 1
             comparison = compare_record(record, oracle_client, neo4j_loader, args)
             if comparison["matched"]:
@@ -476,9 +487,10 @@ def compare_record(
             neo4j_error,
             oracle_rows,
             neo4j_rows,
+            neo4j_loader.primary_by_label,
         )
-    oracle_counter = normalized_counter(oracle_rows)
-    neo4j_counter = normalized_counter(neo4j_rows)
+    oracle_counter = normalized_counter(oracle_rows, neo4j_loader.primary_by_label)
+    neo4j_counter = normalized_counter(neo4j_rows, neo4j_loader.primary_by_label)
     matched = oracle_counter == neo4j_counter
     return comparison_result(
         matched,
@@ -491,6 +503,7 @@ def compare_record(
         "",
         oracle_rows,
         neo4j_rows,
+        neo4j_loader.primary_by_label,
     )
 
 
@@ -505,6 +518,7 @@ def comparison_result(
     neo4j_error: str,
     oracle_rows: Sequence[Dict[str, Any]],
     neo4j_rows: Sequence[Dict[str, Any]],
+    primary_by_label: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     return {
         "matched": matched,
@@ -515,8 +529,8 @@ def comparison_result(
         "neo4j_status": neo4j_status,
         "oracle_error": oracle_error,
         "neo4j_error": neo4j_error,
-        "oracle_rows_sample": normalize_rows(oracle_rows[:5]),
-        "neo4j_rows_sample": normalize_rows(neo4j_rows[:5]),
+        "oracle_rows_sample": normalize_rows(oracle_rows[:5], primary_by_label),
+        "neo4j_rows_sample": normalize_rows(neo4j_rows[:5], primary_by_label),
     }
 
 
@@ -556,51 +570,182 @@ def skip_reason_for_record(
     return ""
 
 
-def normalized_counter(rows: Sequence[Dict[str, Any]]) -> Counter[str]:
-    return Counter(
-        json.dumps(row, sort_keys=True, ensure_ascii=False) for row in normalize_rows(rows)
+def is_nondeterministic_limit_without_order(query: str) -> bool:
+    normalized = _strip_string_literals(query)
+    return bool(
+        re.search(r"\bLIMIT\b", normalized, flags=re.IGNORECASE)
+        and not re.search(r"\bORDER\s+BY\b", normalized, flags=re.IGNORECASE)
     )
 
 
-def normalize_rows(rows: Sequence[Dict[str, Any]]) -> List[Any]:
-    return [normalize_row(row) for row in rows]
+def _strip_string_literals(query: str) -> str:
+    return re.sub(r"'(?:''|\\'|[^'])*'|\"(?:\\\"|[^\"])*\"", "''", query or "")
 
 
-def normalize_row(row: Dict[str, Any]) -> Any:
+def normalized_counter(
+    rows: Sequence[Dict[str, Any]],
+    primary_by_label: Dict[str, str] | None = None,
+) -> Counter[str]:
+    return Counter(
+        json.dumps(row, sort_keys=True, ensure_ascii=False)
+        for row in normalize_rows(rows, primary_by_label)
+    )
+
+
+def normalize_rows(
+    rows: Sequence[Dict[str, Any]],
+    primary_by_label: Dict[str, str] | None = None,
+) -> List[Any]:
+    return [normalize_row(row, primary_by_label) for row in rows]
+
+
+def normalize_row(
+    row: Dict[str, Any],
+    primary_by_label: Dict[str, str] | None = None,
+) -> Any:
     # Compare return values rather than aliases: Oracle aliases often differ from Cypher aliases.
-    return [_normalize_value(value) for value in row.values()]
+    values = list(row.values())
+    if len(values) == 1 and _looks_like_path(values[0]):
+        return _normalize_path(values[0], primary_by_label)
+    return [_normalize_value(value, primary_by_label) for value in values]
 
 
-def _normalize_value(value: Any) -> Any:
+def _normalize_value(value: Any, primary_by_label: Dict[str, str] | None = None) -> Any:
     if value is None:
         return None
     if isinstance(value, bool):
         return 1 if value else 0
     if isinstance(value, Decimal):
-        return int(value) if value == value.to_integral_value() else float(value)
+        return int(value) if value == value.to_integral_value() else round(float(value), 6)
+    if isinstance(value, int):
+        return value
     if isinstance(value, float):
-        return round(value, 12)
+        return int(value) if value.is_integer() else round(value, 6)
+    if isinstance(value, timedelta):
+        return value.total_seconds()
     if isinstance(value, (date, datetime)):
         return value.isoformat()
+    if isinstance(value, str):
+        return _normalize_temporal_string(value)
+    if _looks_like_path(value):
+        return _normalize_path(value, primary_by_label)
     if isinstance(value, (list, tuple)):
-        return [_normalize_value(item) for item in value]
+        return [_normalize_value(item, primary_by_label) for item in value]
     if isinstance(value, dict):
-        return {str(key): _normalize_value(item) for key, item in sorted(value.items())}
+        oracle_identity = _normalize_oracle_graph_identity(value, primary_by_label)
+        if oracle_identity is not None:
+            return oracle_identity
+        return {
+            str(key): _normalize_value(item, primary_by_label)
+            for key, item in sorted(value.items())
+        }
     if hasattr(value, "items") and hasattr(value, "labels"):
-        return {
-            "labels": sorted(str(label) for label in value.labels),
-            "properties": _normalize_value(dict(value.items())),
-        }
+        return _normalize_neo4j_node(value, primary_by_label)
     if hasattr(value, "items") and hasattr(value, "type"):
-        return {
-            "type": str(value.type),
-            "properties": _normalize_value(dict(value.items())),
-        }
+        return _normalize_neo4j_relationship(value, primary_by_label)
     if hasattr(value, "iso_format"):
         return value.iso_format()
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return value
+
+
+def _normalize_temporal_string(value: str) -> str:
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.0{6,9})?(?:Z)?",
+        value,
+    )
+    if match:
+        return match.group(1)
+    return value
+
+
+def _normalize_oracle_graph_identity(
+    value: Dict[str, Any],
+    primary_by_label: Dict[str, str] | None = None,
+) -> Dict[str, Any] | None:
+    if "ELEM_TABLE" not in value or "KEY_VALUE" not in value:
+        return None
+    label = str(value["ELEM_TABLE"])
+    normalized = {
+        "element": OracleNameSanitizer.clean(label, fallback=label),
+    }
+    key = _normalize_value(value["KEY_VALUE"], primary_by_label)
+    if key:
+        normalized["key"] = key
+    return normalized
+
+
+def _normalize_neo4j_node(
+    value: Any,
+    primary_by_label: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    labels = sorted(str(label) for label in value.labels)
+    label = labels[0] if labels else ""
+    properties = dict(value.items())
+    key = _node_key(label, properties, primary_by_label)
+    if key:
+        return {
+            "element": OracleNameSanitizer.clean(label, fallback=label),
+            "key": _normalize_value(key, primary_by_label),
+        }
+    return {
+        "element": OracleNameSanitizer.clean(label, fallback=label),
+        "properties": _normalize_value(properties, primary_by_label),
+    }
+
+
+def _normalize_neo4j_relationship(
+    value: Any,
+    primary_by_label: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    rel_type = str(value.type)
+    normalized: Dict[str, Any] = {
+        "element": OracleNameSanitizer.clean(rel_type, fallback=rel_type),
+    }
+    properties = dict(value.items())
+    if properties:
+        normalized["properties"] = _normalize_value(properties, primary_by_label)
+    return normalized
+
+
+def _node_key(
+    label: str,
+    properties: Dict[str, Any],
+    primary_by_label: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    candidates = []
+    if primary_by_label:
+        candidates.extend(
+            [
+                primary_by_label.get(label),
+                primary_by_label.get(OracleNameSanitizer.clean(label, fallback=label)),
+            ]
+        )
+    candidates.extend(["_id", "vid", "id", f"{label}_id"])
+    candidates.extend(sorted(key for key in properties if key.lower().endswith("_id")))
+    for candidate in candidates:
+        if candidate and candidate in properties:
+            return {candidate: properties[candidate]}
+    return {}
+
+
+def _looks_like_path(value: Any) -> bool:
+    return hasattr(value, "nodes") and hasattr(value, "relationships")
+
+
+def _normalize_path(
+    value: Any,
+    primary_by_label: Dict[str, str] | None = None,
+) -> List[Any]:
+    nodes = list(value.nodes)
+    relationships = list(value.relationships)
+    normalized = []
+    for index, node in enumerate(nodes):
+        normalized.append(_normalize_value(node, primary_by_label))
+        if index < len(relationships):
+            normalized.append(_normalize_value(relationships[index], primary_by_label))
+    return normalized
 
 
 def _convert_value(value: str, type_name: str) -> Any:

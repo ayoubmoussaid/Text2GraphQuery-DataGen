@@ -24,6 +24,10 @@ UNSUPPORTED_PATTERNS = {
     "optional_match": re.compile(r"\bOPTIONAL\s+MATCH\b", re.IGNORECASE),
     "relative_duration": re.compile(r"\bdate\s*\(\s*\)\s*[-+]\s*duration\s*\(", re.IGNORECASE),
     "unwind": re.compile(r"\bUNWIND\b", re.IGNORECASE),
+    "expensive_variable_length_path": re.compile(
+        r"-\s*\[[^\]]*\*(?:\s*\.\.\s*(?:[1-9]\d+)|\s*)\]\s*-",
+        re.IGNORECASE,
+    ),
     "case_label_predicate": re.compile(
         r"\bCASE\b(?:(?!\bEND\b).)*\b[A-Za-z_][A-Za-z0-9_]*\s*:",
         re.IGNORECASE | re.DOTALL,
@@ -283,11 +287,122 @@ def translate_record(
 
 
 def detect_unsupported_features(query: str) -> List[str]:
-    return [
+    searchable_query = mask_string_literals(query or "")
+    features = [
         name
         for name, pattern in UNSUPPORTED_PATTERNS.items()
-        if query and pattern.search(query)
+        if query and pattern.search(searchable_query)
     ]
+    if query and len(re.findall(r"\bWITH\b", searchable_query, flags=re.IGNORECASE)) > 1:
+        features.append("multiple_with")
+    if "optional_match" in features and is_supported_standalone_optional_match(query):
+        features.remove("optional_match")
+    if "optional_match" in features and is_supported_optional_after_with_match(query):
+        features.remove("optional_match")
+    if "optional_match" in features and is_supported_match_optional_with(query):
+        features.remove("optional_match")
+    if "optional_match" in features and is_supported_optional_null_antijoin(query):
+        features.remove("optional_match")
+    return features
+
+
+def mask_string_literals(query: str) -> str:
+    result: List[str] = []
+    index = 0
+    while index < len(query):
+        quote = query[index]
+        if quote not in {"'", '"'}:
+            result.append(quote)
+            index += 1
+            continue
+        result.append(quote)
+        index += 1
+        while index < len(query):
+            char = query[index]
+            if char == "\\" and index + 1 < len(query):
+                result.append(" ")
+                result.append(" ")
+                index += 2
+                continue
+            if char == quote:
+                if quote == "'" and index + 1 < len(query) and query[index + 1] == "'":
+                    result.append(" ")
+                    result.append(" ")
+                    index += 2
+                    continue
+                result.append(quote)
+                index += 1
+                break
+            result.append(" " if not char.isspace() else char)
+            index += 1
+    return "".join(result)
+
+
+def is_supported_standalone_optional_match(query: str) -> bool:
+    normalized = " ".join(str(query or "").split())
+    if not re.match(r"^OPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE):
+        return False
+    if len(re.findall(r"\bOPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE)) != 1:
+        return False
+    if re.search(r"\bWITH\b", normalized, flags=re.IGNORECASE):
+        return False
+    if re.search(r"\bRETURN\s+count\s*\(\s*\*\s*\)", normalized, flags=re.IGNORECASE):
+        return False
+    return True
+
+
+def is_supported_optional_after_with_match(query: str) -> bool:
+    normalized = " ".join(str(query or "").split())
+    if re.match(r"^OPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE):
+        return False
+    if len(re.findall(r"\bOPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE)) != 1:
+        return False
+    if len(re.findall(r"\bWITH\b", normalized, flags=re.IGNORECASE)) != 1:
+        return False
+    if re.search(r"\bRETURN\s+count\s*\(\s*\*\s*\)", normalized, flags=re.IGNORECASE):
+        return False
+    return bool(
+        re.search(
+            r"\bMATCH\b.+\bWITH\b.+\bOPTIONAL\s+MATCH\b.+\bRETURN\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def is_supported_match_optional_with(query: str) -> bool:
+    normalized = " ".join(str(query or "").split())
+    if re.match(r"^OPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE):
+        return False
+    if len(re.findall(r"\bOPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE)) != 1:
+        return False
+    if len(re.findall(r"\bWITH\b", normalized, flags=re.IGNORECASE)) != 1:
+        return False
+    return bool(
+        re.search(
+            r"^\s*MATCH\b.+\bOPTIONAL\s+MATCH\b.+\bWITH\b.+\bRETURN\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def is_supported_optional_null_antijoin(query: str) -> bool:
+    normalized = " ".join(str(query or "").split())
+    if re.match(r"^OPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE):
+        return False
+    if len(re.findall(r"\bOPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE)) != 1:
+        return False
+    if re.search(r"\bWITH\b", normalized, flags=re.IGNORECASE):
+        return False
+    return bool(
+        re.search(
+            r"^\s*MATCH\b.+\bOPTIONAL\s+MATCH\b.+\bWHERE\s+"
+            r"[A-Za-z_][A-Za-z0-9_]*\s+IS\s+NULL\b.+\bRETURN\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _status(

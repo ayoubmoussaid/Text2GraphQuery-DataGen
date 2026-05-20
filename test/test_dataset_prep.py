@@ -1,6 +1,11 @@
 import json
 from pathlib import Path
 
+from dataset_prep.analyze_failures import failure_signature, unsupported_query_signature
+from dataset_prep.compare_oracle_neo4j_results import (
+    is_nondeterministic_limit_without_order,
+    normalize_rows,
+)
 from dataset_prep.discover import DatabaseUnit, discover_database_units, source_query
 from dataset_prep.oracle_loader import DatasetOracleLoader
 from dataset_prep.translate_validate import detect_unsupported_features, graph_name_for
@@ -71,9 +76,144 @@ def test_detect_unsupported_oracle_sqlpgq_features():
     assert "case_label_predicate" in detect_unsupported_features(
         "MATCH (a) RETURN CASE WHEN a:ACCOUNT THEN 1 ELSE 0 END"
     )
+    assert not detect_unsupported_features(
+        "OPTIONAL MATCH (a)-->(b) RETURN a.name, count(b)"
+    )
+    assert not detect_unsupported_features(
+        "MATCH (g:Group) WITH g ORDER BY g.created_date DESC LIMIT 1 "
+        "OPTIONAL MATCH (g)<-[:BelongsTo]-(u:User) RETURN g.name, COUNT(u)"
+    )
+    assert not detect_unsupported_features(
+        "MATCH (q:Question) OPTIONAL MATCH (q)<-[:COMMENTED_ON]-(c:Comment) "
+        "WITH q, count(c) AS commentCount RETURN q.title, commentCount"
+    )
+    assert not detect_unsupported_features(
+        "MATCH (q:Question) OPTIONAL MATCH (q)<-[:COMMENTED_ON]-(c:Comment) "
+        "WHERE c IS NULL RETURN q.title"
+    )
     assert "optional_match" in detect_unsupported_features(
         "MATCH (a) OPTIONAL MATCH (a)--(b) RETURN b"
     )
+    assert "optional_match" in detect_unsupported_features(
+        "OPTIONAL MATCH (a)-->(b) OPTIONAL MATCH (b)-->(c) RETURN c"
+    )
+    assert "optional_match" in detect_unsupported_features(
+        "OPTIONAL MATCH (a)-->(b) RETURN count(*)"
+    )
+    assert "multiple_with" in detect_unsupported_features(
+        "MATCH (a) WITH a MATCH (a)-->(b) WITH b RETURN b"
+    )
+    assert "unwind" not in detect_unsupported_features(
+        "MATCH (q:Question {title: 'use UNWIND and FOREACH safely'}) RETURN q.title"
+    )
+    assert "multiple_with" not in detect_unsupported_features(
+        'MATCH (q:Question {title: "WITH examples in a title"}) RETURN q.title'
+    )
+    assert "expensive_variable_length_path" in detect_unsupported_features(
+        "MATCH (a:ACCOUNT)-[*..10]-(t:TRANSACTION) RETURN t LIMIT 1"
+    )
+    assert "expensive_variable_length_path" not in detect_unsupported_features(
+        "MATCH (person:PERSON)-[:KNOWS*..3]->(friend:PERSON) RETURN friend"
+    )
+
+
+def test_failure_analysis_groups_unsupported_query_shapes():
+    def record(query: str) -> dict:
+        return {
+            "oracle_validation_status": "unsupported",
+            "oracle_translation_category": "Graph-IL Not Support",
+            "oracle_source_query": query,
+            "oracle_unsupported_features": [],
+        }
+
+    assert failure_signature(
+        record("MATCH (a) WITH a MATCH (a)-->(b) WITH a RETURN a")
+    ) == "multiple_with_skipped"
+    multi_with_optional = record(
+        "MATCH (a) WITH a OPTIONAL MATCH (a)-->(b) WITH a RETURN a"
+    )
+    multi_with_optional["oracle_unsupported_features"] = ["optional_match"]
+    assert failure_signature(multi_with_optional) == "multiple_with_skipped"
+    standalone_optional = record("OPTIONAL MATCH (a)-->(b) RETURN a")
+    standalone_optional["oracle_unsupported_features"] = ["optional_match"]
+    assert failure_signature(standalone_optional) == "standalone_optional_match"
+    optional_after_binding = record("MATCH (a) OPTIONAL MATCH (a)-->(b) RETURN a")
+    optional_after_binding["oracle_unsupported_features"] = ["optional_match"]
+    assert failure_signature(optional_after_binding) == "optional_match_left_join_required"
+    assert failure_signature(
+        record("MATCH p=(a)-[:KNOWS*1..3]->(b) RETURN p")
+    ) == "path_variable_return"
+    assert failure_signature(
+        record("MATCH (p:Policy) RETURN AVG(p.effective_date) AS value")
+    ) == "temporal_numeric_aggregate"
+    assert failure_signature(
+        record("MATCH (a)-[e]->(b) RETURN count(DISTINCT e.bad_alias)")
+    ) == "invalid_schema_property"
+    assert failure_signature(
+        record("MATCH (a:Assertion) WHERE a.contradiction_severity > 1 RETURN a")
+    ) == "invalid_schema_property"
+    assert failure_signature(
+        record(
+            "MATCH (g:Group) WITH g ORDER BY g.created_date DESC LIMIT 1 "
+            "OPTIONAL MATCH (g)<-[:BelongsTo]-(u:User) RETURN g.name, COUNT(u)"
+        )
+    ) == "invalid_schema_property"
+    assert failure_signature(
+        record("MATCH (s:Source) RETURN s.name")
+    ) == "invalid_schema_property"
+    assert failure_signature(
+        record("MATCH p=(n1:Resource)-[e]-(n2:Policy) WHERE n2.sensitivity_level <> 'Internal' RETURN p")
+    ) == "invalid_schema_property"
+    assert unsupported_query_signature(
+        "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)-[:ORDERS]->(o:Order) "
+        "WITH s.supplierID AS supplierID, COUNT(DISTINCT o.shipCity) AS cityCount "
+        "WHERE cityCount > 3 RETURN supplierID"
+    ) != "multi_pattern_match"
+
+
+def test_failure_analysis_uses_manifest_for_invalid_schema(tmp_path: Path):
+    import_config = tmp_path / "import_config.json"
+    import_config.write_text(
+        json.dumps(
+            {
+                "schema": [
+                    {
+                        "label": "Product",
+                        "type": "VERTEX",
+                        "properties": [{"name": "productName"}, {"name": "productID"}],
+                    },
+                    {
+                        "label": "Order",
+                        "type": "VERTEX",
+                        "properties": [{"name": "freight"}, {"name": "orderDate"}],
+                    },
+                    {
+                        "label": "ORDERS",
+                        "type": "EDGE",
+                        "properties": [{"name": "quantity"}],
+                        "constraints": [["Order", "Product"]],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def record(query: str) -> dict:
+        return {
+            "oracle_validation_status": "unsupported",
+            "oracle_translation_category": "Graph-IL Not Support",
+            "oracle_source_query": query,
+            "oracle_unsupported_features": [],
+            "oracle_dataset_meta": {"import_config": str(import_config)},
+        }
+
+    assert failure_signature(
+        record("MATCH (p:Product)-[:ORDERS]->(o:Order) RETURN o.freight")
+    ) == "invalid_schema_direction"
+    assert failure_signature(
+        record("MATCH (p:Product) RETURN p.missingProperty")
+    ) == "invalid_schema_property"
 
 
 def test_loader_converts_oracle_date_values():
@@ -89,6 +229,89 @@ def test_loader_converts_oracle_date_values():
     assert loader._convert_value("False", "NUMBER(1)") == 0
     assert loader._convert_value("abcde", "VARCHAR2(3)") == "abc"
     assert loader._convert_value("ééé", "VARCHAR2(4)") == "éé"
+
+
+def test_compare_normalizes_temporal_strings_and_numeric_precision():
+    oracle_rows = [{"created_at": "2025-01-01T12:00:00", "score": 1}]
+    neo4j_rows = [{"created_at": "2025-01-01T12:00:00.000000000", "score": 1.0}]
+
+    assert normalize_rows(oracle_rows) == normalize_rows(neo4j_rows)
+    assert normalize_rows([{"allocation": 0.764800012112}]) == normalize_rows(
+        [{"allocation": 0.7648}]
+    )
+
+
+def test_compare_normalizes_oracle_and_neo4j_node_identity():
+    class FakeNode:
+        labels = {"director"}
+
+        def items(self):
+            return {
+                "_id": 57,
+                "name": "Pinocchio",
+                "director": "Ben Sharpsteen",
+            }.items()
+
+    oracle_rows = [
+        {
+            "director": {
+                "ELEM_TABLE": "director",
+                "GRAPH_NAME": "G",
+                "GRAPH_OWNER": "SYSTEM",
+                "KEY_VALUE": {"_id": 57},
+            }
+        }
+    ]
+    neo4j_rows = [{"director": FakeNode()}]
+
+    assert normalize_rows(oracle_rows, {"director": "_id"}) == normalize_rows(
+        neo4j_rows,
+        {"director": "_id"},
+    )
+
+
+def test_compare_normalizes_single_neo4j_path_to_flat_element_sequence():
+    class FakeNode:
+        def __init__(self, label: str, key: str, value: str):
+            self.labels = {label}
+            self._props = {key: value}
+
+        def items(self):
+            return self._props.items()
+
+    class FakeRelationship:
+        type = "POSTS"
+
+        def items(self):
+            return {}.items()
+
+    class FakePath:
+        nodes = [FakeNode("USER", "user_id", "U000001"), FakeNode("POST", "post_id", "P000001")]
+        relationships = [FakeRelationship()]
+
+    oracle_rows = [
+        {
+            "p_n1_ID": {"ELEM_TABLE": "USER", "KEY_VALUE": {"user_id": "U000001"}},
+            "p_e1_ID": {"ELEM_TABLE": "POSTS", "KEY_VALUE": {}},
+            "p_x_ID": {"ELEM_TABLE": "POST", "KEY_VALUE": {"post_id": "P000001"}},
+        }
+    ]
+    neo4j_rows = [{"p": FakePath()}]
+
+    assert normalize_rows(oracle_rows, {"USER": "user_id", "POST": "post_id"}) == normalize_rows(
+        neo4j_rows,
+        {"USER": "user_id", "POST": "post_id"},
+    )
+
+
+def test_compare_detects_nondeterministic_limit_without_order_by():
+    assert is_nondeterministic_limit_without_order("MATCH (n) RETURN n LIMIT 10")
+    assert not is_nondeterministic_limit_without_order(
+        "MATCH (n) RETURN n ORDER BY n.name LIMIT 10"
+    )
+    assert not is_nondeterministic_limit_without_order(
+        "MATCH (n {text: 'ORDER BY words LIMIT examples'}) RETURN n"
+    )
 
 
 def test_loader_uses_vertex_file_when_edge_label_collides():
@@ -134,6 +357,24 @@ def test_loader_exposes_oracle_graph_label_map_for_collisions():
     assert loader.node_label_map() == {"book": ["book"]}
     assert loader.edge_label_map() == {
         "book": ["book_language_book_publisher", "book_author_book"]
+    }
+
+
+def test_loader_exposes_file_stem_label_aliases():
+    loader = DatasetOracleLoader.__new__(DatasetOracleLoader)
+    loader.config = {
+        "files": [
+            {"label": "InfoSource", "path": "Source.csv", "columns": ["infosource_id"]},
+        ]
+    }
+    loader.manifest = {
+        "vertices": [{"label": "InfoSource", "graph_label": "InfoSource"}],
+        "edges": [],
+    }
+
+    assert loader.node_label_map() == {
+        "InfoSource": ["InfoSource"],
+        "Source": ["InfoSource"],
     }
 
 

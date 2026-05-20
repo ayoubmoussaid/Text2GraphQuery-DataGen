@@ -86,8 +86,16 @@ class DatasetOracleLoader:
 
     def _label_map(self, items: Iterable[Dict[str, Any]]) -> Dict[str, List[str]]:
         mapping: Dict[str, List[str]] = {}
+        files_by_label: Dict[str, List[Dict[str, Any]]] = {}
+        for file_item in getattr(self, "config", {}).get("files", []):
+            files_by_label.setdefault(file_item.get("label", ""), []).append(file_item)
         for item in items:
-            mapping.setdefault(item["label"], []).append(item.get("graph_label", item["label"]))
+            graph_label = item.get("graph_label", item["label"])
+            mapping.setdefault(item["label"], []).append(graph_label)
+            for file_item in files_by_label.get(item["label"], []):
+                alias = Path(str(file_item.get("path", ""))).stem
+                if alias and alias != item["label"]:
+                    mapping.setdefault(alias, []).append(graph_label)
         return mapping
 
     def _execute_script(self, script: str) -> None:

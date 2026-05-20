@@ -119,8 +119,22 @@ def build_report(
 def failure_signature(record: Dict[str, Any]) -> str:
     status = record.get("oracle_validation_status", "")
     if status == "unsupported":
+        query_signature = unsupported_query_signature(
+            record.get("oracle_source_query") or ""
+        )
+        if query_signature in {
+            "multiple_with_skipped",
+            "standalone_optional_match",
+            "optional_match_left_join_required",
+        }:
+            return query_signature
+        schema_signature = schema_mismatch_signature(record)
+        if schema_signature:
+            return schema_signature
         features = record.get("oracle_unsupported_features") or []
-        return ",".join(features) or record.get("oracle_translation_category") or "unsupported"
+        if features:
+            return ",".join(features)
+        return query_signature or record.get("oracle_translation_category") or "unsupported"
 
     error = str(record.get("oracle_validation_error") or "").strip()
     if not error:
@@ -132,8 +146,238 @@ def failure_signature(record: Dict[str, Any]) -> str:
     return error.splitlines()[0][:240]
 
 
+def unsupported_query_signature(query: str) -> str:
+    normalized = " ".join(str(query or "").split())
+    if not normalized:
+        return ""
+    if len(re.findall(r"\bWITH\b", normalized, flags=re.IGNORECASE)) > 1:
+        return "multiple_with_skipped"
+    if re.search(
+        r"\.(?:bad_alias|role_type|contradiction_severity|support_strength)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    ) or re.search(
+        r"\bc\.validity_start\b|\bs\.name\b|\bn2\.sensitivity_level\b|\bg\.created_date\b",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return "invalid_schema_property"
+    if re.search(r"\bOPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE):
+        if re.match(r"^OPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE):
+            return "standalone_optional_match"
+        return "optional_match_left_join_required"
+    if re.search(
+        r"\b(?:AVG|SUM)\s*\([^)]*(?:date|timestamp)[^)]*\)",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return "temporal_numeric_aggregate"
+    if re.search(
+        r"\bMATCH\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s*=",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return "path_variable_return"
+    if re.search(r"\bWITH\b.+\bMATCH\b", normalized, flags=re.IGNORECASE):
+        return "with_match_pipeline"
+    match_prefix = normalized.split(" WHERE ", 1)[0].split(" WITH ", 1)[0].split(" RETURN ", 1)[0]
+    if "," in match_prefix:
+        return "multi_pattern_match"
+    return ""
+
+
+def schema_mismatch_signature(record: Dict[str, Any]) -> str:
+    query = str(record.get("oracle_source_query") or "")
+    meta = record.get("oracle_dataset_meta") or {}
+    import_config = meta.get("import_config")
+    if not query or not import_config:
+        return ""
+    config_path = Path(import_config)
+    if not config_path.exists():
+        return ""
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    schema = config.get("schema") or []
+    node_props = {
+        item.get("label"): {
+            prop.get("name")
+            for prop in item.get("properties", [])
+            if prop.get("name")
+        }
+        for item in schema
+        if item.get("type") == "VERTEX"
+    }
+    edge_props = {
+        item.get("label"): {
+            prop.get("name")
+            for prop in item.get("properties", [])
+            if prop.get("name")
+        }
+        for item in schema
+        if item.get("type") == "EDGE"
+    }
+    edge_constraints = {
+        item.get("label"): {
+            (constraint[0], constraint[1])
+            for constraint in item.get("constraints", [])
+            if isinstance(constraint, list) and len(constraint) == 2
+        }
+        for item in schema
+        if item.get("type") == "EDGE"
+    }
+    variable_labels, edge_variable_labels = _cypher_variable_labels(query)
+    for variable, label in variable_labels.items():
+        if label not in node_props:
+            return "invalid_schema_label"
+    for variable, label in edge_variable_labels.items():
+        if label not in edge_props:
+            return "invalid_schema_label"
+    for variable, prop in _cypher_property_references(query):
+        if variable in variable_labels and not _property_exists(prop, node_props.get(variable_labels[variable], set())):
+            return "invalid_schema_property"
+        if variable in edge_variable_labels and not _property_exists(prop, edge_props.get(edge_variable_labels[variable], set())):
+            return "invalid_schema_property"
+    for label, properties in _cypher_property_maps(query, node=True):
+        if label in node_props:
+            for prop in properties:
+                if not _property_exists(prop, node_props[label]):
+                    return "invalid_schema_property"
+    for label, properties in _cypher_property_maps(query, node=False):
+        if label in edge_props:
+            for prop in properties:
+                if not _property_exists(prop, edge_props[label]):
+                    return "invalid_schema_property"
+    for left_label, direction, edge_label, right_label in _cypher_edge_triples(query):
+        constraints = edge_constraints.get(edge_label)
+        if not constraints or not left_label or not right_label:
+            continue
+        expected = (left_label, right_label) if direction == "right" else (right_label, left_label)
+        if expected not in constraints:
+            return "invalid_schema_direction"
+    return ""
+
+
+def _cypher_variable_labels(query: str) -> tuple[dict[str, str], dict[str, str]]:
+    node_labels: dict[str, str] = {}
+    edge_labels: dict[str, str] = {}
+    for match in re.finditer(r"\(\s*(?P<var>[A-Za-z_][A-Za-z0-9_]*)?\s*:\s*`?(?P<label>[^`(){},\s]+)`?", query):
+        variable = match.group("var")
+        if variable:
+            node_labels[variable] = _clean_schema_name(match.group("label"))
+    for match in re.finditer(r"\[\s*(?P<var>[A-Za-z_][A-Za-z0-9_]*)?\s*:\s*`?(?P<label>[^`\]{}\s]+)`?", query):
+        variable = match.group("var")
+        if variable:
+            edge_labels[variable] = _clean_schema_name(match.group("label"))
+    return node_labels, edge_labels
+
+
+def _cypher_property_references(query: str) -> list[tuple[str, str]]:
+    protected = re.sub(r"'(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\"", "''", query)
+    references = []
+    for match in re.finditer(
+        r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\."
+        r"(?:`(?P<quoted>[^`]+)`|(?P<bare>[A-Za-z_][A-Za-z0-9_$#-]*))",
+        protected,
+    ):
+        references.append(
+            (match.group("var"), _clean_schema_name(match.group("quoted") or match.group("bare")))
+        )
+    return references
+
+
+def _cypher_property_maps(query: str, node: bool) -> list[tuple[str, list[str]]]:
+    open_char, close_char = ("(", ")") if node else ("[", "]")
+    escaped_open = re.escape(open_char)
+    escaped_close = re.escape(close_char)
+    pattern = re.compile(
+        escaped_open
+        + r"\s*(?:[A-Za-z_][A-Za-z0-9_]*)?\s*:\s*`?(?P<label>[^`(){}\]\[,\s]+)`?"
+        + r"\s*\{(?P<body>[^}]*)\}"
+        + escaped_close
+    )
+    maps = []
+    for match in pattern.finditer(query):
+        properties = [
+            _clean_schema_name(prop.group("prop"))
+            for prop in re.finditer(r"`?(?P<prop>[A-Za-z_][A-Za-z0-9_$#-]*)`?\s*:", match.group("body"))
+        ]
+        maps.append((_clean_schema_name(match.group("label")), properties))
+    return maps
+
+
+def _cypher_edge_triples(query: str) -> list[tuple[str, str, str, str]]:
+    node = r"\(\s*(?:[A-Za-z_][A-Za-z0-9_]*)?\s*:\s*`?(?P<NAME>[^`(){}\]\[,\s]+)`?(?:\s*\{[^}]*\})?\s*\)"
+    edge = r"\[\s*(?:[A-Za-z_][A-Za-z0-9_]*)?\s*:\s*`?(?P<edge>[^`\]{}\s]+)`?(?:\s*\{[^}]*\})?\s*\]"
+    triples = []
+    right_pattern = (
+        node.replace("NAME", "left")
+        + r"\s*-\s*"
+        + edge
+        + r"\s*->\s*"
+        + node.replace("NAME", "right")
+    )
+    left_pattern = (
+        node.replace("NAME", "left")
+        + r"\s*<-\s*"
+        + edge
+        + r"\s*-\s*"
+        + node.replace("NAME", "right")
+    )
+    for start in range(len(query)):
+        match = re.match(right_pattern, query[start:])
+        if match:
+            triples.append((
+                _clean_schema_name(match.group("left")),
+                "right",
+                _clean_schema_name(match.group("edge")),
+                _clean_schema_name(match.group("right")),
+            ))
+        match = re.match(left_pattern, query[start:])
+        if match:
+            triples.append((
+                _clean_schema_name(match.group("left")),
+                "left",
+                _clean_schema_name(match.group("edge")),
+                _clean_schema_name(match.group("right")),
+            ))
+    return triples
+
+
+def _property_exists(property_name: str, properties: set[str]) -> bool:
+    clean = _clean_schema_name(property_name)
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", clean).lower()
+    candidates = {clean, snake, clean.lower(), snake.lower()}
+    return any(prop in candidates or prop.lower() in candidates for prop in properties)
+
+
+def _clean_schema_name(value: str) -> str:
+    return str(value or "").strip().strip("`").strip('"')
+
+
 def likely_next_action(status: str, signature: str) -> str:
     if status == "unsupported":
+        if signature == "multiple_with_skipped":
+            return "Skipped by policy: do not spend translator work on queries with more than one WITH."
+        if signature == "path_variable_return":
+            return "Keep unsupported unless grouped path projection semantics are added for Oracle SQL/PGQ."
+        if signature == "temporal_numeric_aggregate":
+            return "Keep unsupported unless the source query explicitly converts temporal values to numeric durations."
+        if signature == "expensive_variable_length_path":
+            return "Skip broad undirected variable-length paths that can exhaust Oracle validation resources."
+        if signature == "invalid_schema_property":
+            return "Treat as invalid source/schema mismatch; do not emit SQL for absent properties."
+        if signature == "optional_match":
+            return "Requires a real SQL LEFT JOIN rewrite; keep unsupported until optional semantics are implemented."
+        if signature == "standalone_optional_match":
+            return "Standalone OPTIONAL MATCH differs from MATCH only for empty-match null-row semantics; keep unsupported unless that behavior is modeled."
+        if signature == "optional_match_left_join_required":
+            return "Requires a SQL LEFT JOIN against prior bindings; keep unsupported until optional semantics are implemented."
+        if signature == "with_match_pipeline":
+            return "Inspect whether this single-WITH pipeline is covered by staged SQL support; add a focused test if fixable."
+        if signature == "multi_pattern_match":
+            return "Inspect comma-separated path patterns for schema validity and shared-variable support."
         return (
             "Decide whether this Cypher feature maps to documented Oracle SQL/PGQ; "
             "otherwise keep classified as unsupported."
