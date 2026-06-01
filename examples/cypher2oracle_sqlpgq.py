@@ -48,45 +48,6 @@ def cypher2oracle_sqlpgq(
             return optional_query
         return "Unable to Translate to Oracle SQL/PGQ", "Graph-IL Not Support"
 
-    if _contains_optional_match(query):
-        optional_query = _translate_optional_null_antijoin(
-            query,
-            graph_name=graph_name,
-            node_label_map=node_label_map,
-            edge_label_map=edge_label_map,
-            property_type_map=property_type_map,
-            node_primary_key_map=node_primary_key_map,
-            edge_primary_key_map=edge_primary_key_map,
-            strict_property_validation=strict_property_validation,
-        )
-        if optional_query is not None:
-            return optional_query
-        optional_query = _translate_match_optional_with(
-            query,
-            graph_name=graph_name,
-            node_label_map=node_label_map,
-            edge_label_map=edge_label_map,
-            property_type_map=property_type_map,
-            node_primary_key_map=node_primary_key_map,
-            edge_primary_key_map=edge_primary_key_map,
-            strict_property_validation=strict_property_validation,
-        )
-        if optional_query is not None:
-            return optional_query
-        optional_query = _translate_optional_after_with_match(
-            query,
-            graph_name=graph_name,
-            node_label_map=node_label_map,
-            edge_label_map=edge_label_map,
-            property_type_map=property_type_map,
-            node_primary_key_map=node_primary_key_map,
-            edge_primary_key_map=edge_primary_key_map,
-            strict_property_validation=strict_property_validation,
-        )
-        if optional_query is not None:
-            return optional_query
-        return "Unable to Translate to Oracle SQL/PGQ", "Graph-IL Not Support"
-
     union_query = _translate_union_query(
         query,
         graph_name=graph_name,

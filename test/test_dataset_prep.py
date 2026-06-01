@@ -3,8 +3,11 @@ from pathlib import Path
 
 from dataset_prep.analyze_failures import failure_signature, unsupported_query_signature
 from dataset_prep.compare_oracle_neo4j_results import (
+    DatasetNeo4jLoader,
     is_nondeterministic_limit_without_order,
+    is_order_by_limit_query,
     normalize_rows,
+    select_records_for_range,
 )
 from dataset_prep.discover import DatabaseUnit, discover_database_units, source_query
 from dataset_prep.oracle_loader import DatasetOracleLoader
@@ -91,11 +94,14 @@ def test_detect_unsupported_oracle_sqlpgq_features():
         "MATCH (q:Question) OPTIONAL MATCH (q)<-[:COMMENTED_ON]-(c:Comment) "
         "WHERE c IS NULL RETURN q.title"
     )
-    assert "optional_match" in detect_unsupported_features(
+    assert not detect_unsupported_features(
         "MATCH (a) OPTIONAL MATCH (a)--(b) RETURN b"
     )
     assert "optional_match" in detect_unsupported_features(
         "OPTIONAL MATCH (a)-->(b) OPTIONAL MATCH (b)-->(c) RETURN c"
+    )
+    assert "optional_match" in detect_unsupported_features(
+        "MATCH (a) OPTIONAL MATCH (b) RETURN b"
     )
     assert "optional_match" in detect_unsupported_features(
         "OPTIONAL MATCH (a)-->(b) RETURN count(*)"
@@ -239,6 +245,12 @@ def test_compare_normalizes_temporal_strings_and_numeric_precision():
     assert normalize_rows([{"allocation": 0.764800012112}]) == normalize_rows(
         [{"allocation": 0.7648}]
     )
+    assert normalize_rows([{"epoch": 1613446786}]) == normalize_rows(
+        [{"epoch": 1613446786.0000002}]
+    )
+    assert normalize_rows([{"date_value": "2025-01-01T00:00:00"}]) == normalize_rows(
+        [{"date_value": "2025-01-01"}]
+    )
 
 
 def test_compare_normalizes_oracle_and_neo4j_node_identity():
@@ -312,6 +324,89 @@ def test_compare_detects_nondeterministic_limit_without_order_by():
     assert not is_nondeterministic_limit_without_order(
         "MATCH (n {text: 'ORDER BY words LIMIT examples'}) RETURN n"
     )
+    assert is_order_by_limit_query("MATCH (n) RETURN n ORDER BY n.name LIMIT 10")
+
+
+def test_compare_selects_offset_query_ranges():
+    records = [{"id": index} for index in range(5)]
+
+    assert select_records_for_range(records, query_offset=2, limit_queries=2) == [
+        {"id": 2},
+        {"id": 3},
+    ]
+    assert select_records_for_range(records, query_offset=3) == [{"id": 3}, {"id": 4}]
+    assert select_records_for_range(records, query_offset=-10, limit_queries=1) == [{"id": 0}]
+
+
+def test_neo4j_compare_prepares_string_backed_boolean_literals():
+    loader = DatasetNeo4jLoader.__new__(DatasetNeo4jLoader)
+    loader.property_types_by_label = {
+        "Question": {"answered": "STRING"},
+        "Answer": {"is_accepted": "STRING"},
+        "Product": {"discontinued": "STRING"},
+        "Role": {"is_compliant": "BOOL"},
+    }
+
+    assert loader.prepare_query(
+        "MATCH (q:Question {answered: true}) RETURN q"
+    ) == "MATCH (q:Question {answered: 'true'}) RETURN q"
+    assert loader.prepare_query(
+        "MATCH (p:Product) WHERE p.discontinued = false RETURN p"
+    ) == "MATCH (p:Product) WHERE p.discontinued = 'false' RETURN p"
+    assert loader.prepare_query(
+        "MATCH (q:Question) WHERE NOT q.answered RETURN q"
+    ) == "MATCH (q:Question) WHERE q.answered = 'false' RETURN q"
+    assert loader.prepare_query(
+        "MATCH (r:Role) WHERE r.is_compliant = true RETURN r"
+    ) == "MATCH (r:Role) WHERE r.is_compliant = true RETURN r"
+
+
+def test_neo4j_compare_prepares_string_backed_date_comparisons():
+    loader = DatasetNeo4jLoader.__new__(DatasetNeo4jLoader)
+    loader.property_types_by_label = {
+        "Director": {"died": "STRING"},
+        "Movie": {"release_date": "STRING"},
+        "Question": {"createdAt": "STRING"},
+        "Event": {"event_date": "DATE"},
+    }
+
+    assert loader.prepare_query(
+        "MATCH (d:Director) WHERE d.died > date('2000-01-01') RETURN d"
+    ) == "MATCH (d:Director) WHERE date(d.died) > date('2000-01-01') RETURN d"
+    assert loader.prepare_query(
+        "MATCH (m:Movie) WHERE date('2000-01-01') > m.release_date RETURN m"
+    ) == "MATCH (m:Movie) WHERE date('2000-01-01') > date(m.release_date) RETURN m"
+    assert loader.prepare_query(
+        "MATCH (e:Event) WHERE e.event_date > date('2000-01-01') RETURN e"
+    ) == "MATCH (e:Event) WHERE e.event_date > date('2000-01-01') RETURN e"
+    assert loader.prepare_query(
+        "MATCH (q:Question) WHERE date(q.createdAt).day = 1 RETURN q"
+    ) == "MATCH (q:Question) WHERE datetime(q.createdAt).day = 1 RETURN q"
+    assert loader.prepare_query(
+        "MATCH (q:Question) WHERE q.createdAt.day = 1 RETURN q"
+    ) == "MATCH (q:Question) WHERE datetime(q.createdAt).day = 1 RETURN q"
+
+
+def test_neo4j_compare_prepares_string_backed_numeric_comparisons():
+    loader = DatasetNeo4jLoader.__new__(DatasetNeo4jLoader)
+    loader.property_types_by_label = {
+        "Answer": {"uuid": "STRING"},
+        "Product": {"unitsOnOrder": "STRING", "reorderLevel": "INT64"},
+        "Order": {"freight": "STRING"},
+    }
+
+    assert loader.prepare_query(
+        "MATCH (p:Product) WHERE p.unitsOnOrder > 50 RETURN p"
+    ) == "MATCH (p:Product) WHERE p.unitsOnOrder > '50' RETURN p"
+    assert loader.prepare_query(
+        "MATCH (o:Order) WHERE 100 < o.freight RETURN o"
+    ) == "MATCH (o:Order) WHERE '100' < o.freight RETURN o"
+    assert loader.prepare_query(
+        "MATCH (p:Product) WHERE p.reorderLevel > 50 RETURN p"
+    ) == "MATCH (p:Product) WHERE p.reorderLevel > 50 RETURN p"
+    assert loader.prepare_query(
+        "MATCH (a:Answer {uuid: 69273049}) RETURN a"
+    ) == "MATCH (a:Answer {uuid: '69273049'}) RETURN a"
 
 
 def test_loader_uses_vertex_file_when_edge_label_collides():

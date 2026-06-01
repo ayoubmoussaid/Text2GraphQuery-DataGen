@@ -22,9 +22,9 @@ poetry install
 Oracle live validation and Oracle-vs-Neo4j comparison require:
 
 ```bash
-export ORACLE_DSN='localhost:1521/FREEPDB1'
-export ORACLE_USER='...'
-export ORACLE_PASSWORD='...'
+export ORACLE_DSN="localhost:1521/FREEPDB1"
+export ORACLE_USER="SYSTEM"
+export ORACLE_PASSWORD="tiger"
 ```
 
 Neo4j comparison additionally requires:

@@ -295,6 +295,8 @@ def detect_unsupported_features(query: str) -> List[str]:
     ]
     if query and len(re.findall(r"\bWITH\b", searchable_query, flags=re.IGNORECASE)) > 1:
         features.append("multiple_with")
+    if "optional_match" in features and is_supported_correlated_optional_match(query):
+        features.remove("optional_match")
     if "optional_match" in features and is_supported_standalone_optional_match(query):
         features.remove("optional_match")
     if "optional_match" in features and is_supported_optional_after_with_match(query):
@@ -336,6 +338,42 @@ def mask_string_literals(query: str) -> str:
             result.append(" " if not char.isspace() else char)
             index += 1
     return "".join(result)
+
+
+def is_supported_correlated_optional_match(query: str) -> bool:
+    normalized = " ".join(str(query or "").split())
+    if re.match(r"^OPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE):
+        return False
+    if len(re.findall(r"\bOPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE)) != 1:
+        return False
+    if len(re.findall(r"\bWITH\b", normalized, flags=re.IGNORECASE)) > 1:
+        return False
+    optional_match = re.search(r"\bOPTIONAL\s+MATCH\b", normalized, flags=re.IGNORECASE)
+    if not optional_match:
+        return False
+    base_fragment = normalized[: optional_match.start()]
+    optional_tail = normalized[optional_match.end() :]
+    optional_end = len(optional_tail)
+    for keyword_match in re.finditer(r"\b(?:WITH|RETURN)\b", optional_tail, flags=re.IGNORECASE):
+        optional_end = keyword_match.start()
+        break
+    optional_fragment = optional_tail[:optional_end]
+    base_variables = set(_declared_cypher_variables(base_fragment))
+    optional_variables = set(_declared_cypher_variables(optional_fragment))
+    return bool(base_variables & optional_variables)
+
+
+def _declared_cypher_variables(fragment: str) -> List[str]:
+    variables: List[str] = []
+    for pattern in (
+        r"\(\s*(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?::|[){])",
+        r"\[\s*(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*(?::|[\]{])",
+    ):
+        for match in re.finditer(pattern, fragment or ""):
+            variable = match.group("var")
+            if variable not in variables:
+                variables.append(variable)
+    return variables
 
 
 def is_supported_standalone_optional_match(query: str) -> bool:

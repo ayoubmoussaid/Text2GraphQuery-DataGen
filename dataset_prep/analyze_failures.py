@@ -369,11 +369,11 @@ def likely_next_action(status: str, signature: str) -> str:
         if signature == "invalid_schema_property":
             return "Treat as invalid source/schema mismatch; do not emit SQL for absent properties."
         if signature == "optional_match":
-            return "Requires a real SQL LEFT JOIN rewrite; keep unsupported until optional semantics are implemented."
+            return "Correlated OPTIONAL MATCH should translate through the Graph IR LEFT JOIN path; inspect unsupported samples for unsupported optional shapes."
         if signature == "standalone_optional_match":
             return "Standalone OPTIONAL MATCH differs from MATCH only for empty-match null-row semantics; keep unsupported unless that behavior is modeled."
         if signature == "optional_match_left_join_required":
-            return "Requires a SQL LEFT JOIN against prior bindings; keep unsupported until optional semantics are implemented."
+            return "Retry with Graph IR OPTIONAL MATCH support; remaining cases likely lack correlation or exceed the v1 optional scope."
         if signature == "with_match_pipeline":
             return "Inspect whether this single-WITH pipeline is covered by staged SQL support; add a focused test if fixable."
         if signature == "multi_pattern_match":

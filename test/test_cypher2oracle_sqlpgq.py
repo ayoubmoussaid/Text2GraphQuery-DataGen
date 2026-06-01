@@ -1,4 +1,8 @@
 from examples.cypher2oracle_sqlpgq import cypher2oracle_sqlpgq
+from app.core.clauses.match_clause import MatchClause
+from app.impl.tugraph_cypher.ast_visitor.tugraph_cypher_ast_visitor import (
+    TugraphCypherAstVisitor,
+)
 
 
 def _translate(cypher: str) -> str:
@@ -39,6 +43,22 @@ def test_cypher2oracle_sqlpgq_translates_simple_node_return_property():
 
     assert 'MATCH (p IS "PERSON")' in query
     assert 'COLUMNS (p."name" AS person_name)' in query
+
+
+def test_cypher_ast_marks_optional_match_clause():
+    visitor = TugraphCypherAstVisitor()
+
+    success, optional_pattern = visitor.get_query_pattern(
+        "OPTIONAL MATCH (a)-->(b) RETURN b"
+    )
+    assert success
+    optional_match = next(clause for clause in optional_pattern if isinstance(clause, MatchClause))
+    assert optional_match.optional
+
+    success, regular_pattern = visitor.get_query_pattern("MATCH (a)-->(b) RETURN b")
+    assert success
+    regular_match = next(clause for clause in regular_pattern if isinstance(clause, MatchClause))
+    assert not regular_match.optional
 
 
 def test_cypher2oracle_sqlpgq_translates_directed_edge_and_where():
@@ -544,7 +564,19 @@ def test_cypher2oracle_sqlpgq_translates_size_split_word_count():
         'MATCH (m:Movie) RETURN size(split(m.overview, " ")) AS word_count'
     )
 
-    assert "REGEXP_COUNT(m.\"overview\", '\\\\S+') AS word_count" in query
+    assert "REGEXP_COUNT(m.\"overview\", '\\S+') AS word_count" in query
+
+
+def test_cypher2oracle_sqlpgq_translates_with_size_split_word_count_aggregate():
+    query = _translate_sql(
+        'MATCH (q:Question)-[:TAGGED]->(t:Tag {name: "graphql"}) '
+        'WITH size(split(q.text, " ")) AS wordsInQuestion '
+        "RETURN avg(wordsInQuestion) AS averageWordCount"
+    )
+
+    assert "WITH stage_1 AS" in query
+    assert "REGEXP_COUNT(q.\"text\", '\\S+') AS wordsInQuestion" in query
+    assert "SELECT AVG(wordsInQuestion) AS averageWordCount" in query
 
 
 def test_cypher2oracle_sqlpgq_translates_vertex_comparisons():
@@ -875,6 +907,79 @@ def test_cypher2oracle_sqlpgq_translates_aggregate_with_to_cte():
     assert "ORDER BY tweet_count DESC" in query
 
 
+def test_cypher2oracle_sqlpgq_translates_correlated_optional_match_to_left_join():
+    query = _translate_sql(
+        "MATCH (a:Person) "
+        "OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) "
+        "RETURN a.name AS person_name, b.name AS friend_name"
+    )
+
+    assert query.startswith("WITH stage_1 AS")
+    assert "stage_2 AS" in query
+    assert "LEFT JOIN stage_2 ON stage_2.a_VALUE = stage_1.stage_1_a_VALUE" in query
+    assert "stage_1.person_name AS person_name" in query
+    assert "stage_2.friend_name AS friend_name" in query
+
+
+def test_cypher2oracle_sqlpgq_translates_optional_match_after_with_to_left_join():
+    query = _translate_sql(
+        "MATCH (a:Person) WITH a "
+        "OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) "
+        "RETURN a.name AS person_name, b.name AS friend_name"
+    )
+
+    assert "LEFT JOIN stage_2 ON stage_2.a_VALUE = stage_1.stage_1_a_VALUE" in query
+    assert "stage_1.person_name AS person_name" in query
+    assert "stage_2.friend_name AS friend_name" in query
+
+
+def test_cypher2oracle_sqlpgq_aggregates_optional_match_rows():
+    query = _translate_sql(
+        "MATCH (a:Person) "
+        "OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) "
+        "WITH a, count(b) AS friend_count "
+        "RETURN a.name AS person_name, friend_count"
+    )
+
+    assert "LEFT JOIN stage_2 ON stage_2.a_VALUE = stage_1.stage_1_a_VALUE" in query
+    assert "COUNT(stage_2.b_VALUE) AS friend_count" in query
+    assert "GROUP BY stage_1.stage_1_a_VALUE" in query
+    assert "stage_1.a_name AS a_name" in query
+
+
+def test_cypher2oracle_sqlpgq_keeps_optional_where_inside_optional_stage():
+    query = _translate_sql(
+        "MATCH (a:Person) "
+        "OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) "
+        "WHERE b.age > 30 "
+        "RETURN a.name AS person_name, b.name AS friend_name"
+    )
+
+    assert "FROM stage_1\nLEFT JOIN stage_2 ON stage_2.a_VALUE = stage_1.stage_1_a_VALUE" in query
+    assert query.index('WHERE b."age" > 30') < query.index(
+        'COLUMNS (b."name" AS friend_name'
+    )
+
+
+def test_cypher2oracle_sqlpgq_rejects_unsupported_optional_match_shapes():
+    query, category = cypher2oracle_sqlpgq(
+        "MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) "
+        "OPTIONAL MATCH (b)-[:KNOWS]->(c:Person) RETURN c.name",
+        graph_name="MOVIE_GRAPH",
+    )
+
+    assert query == "Unable to Translate to Oracle SQL/PGQ"
+    assert category == "Graph-IL Not Support"
+
+    query, category = cypher2oracle_sqlpgq(
+        "MATCH (a:Person) OPTIONAL MATCH (b:Person) RETURN b.name",
+        graph_name="MOVIE_GRAPH",
+    )
+
+    assert query == "Unable to Translate to Oracle SQL/PGQ"
+    assert category == "Graph-IL Not Support"
+
+
 def test_cypher2oracle_sqlpgq_carries_with_variable_properties_to_cte():
     query = _translate_sql(
         "MATCH (u:USER)-[:Initiates]->(t:TRANSACTION) "
@@ -1149,7 +1254,7 @@ def test_cypher2oracle_sqlpgq_translates_with_match_join_on_carried_variable():
     assert "VERTEX_ID(u) AS stage_1_u_VALUE" in query
     assert "VERTEX_ID(u) AS u_VALUE" in query
     assert "JOIN stage_1 ON stage_2.u_VALUE = stage_1.stage_1_u_VALUE" in query
-    assert "SELECT DISTINCT name, department" in query
+    assert "SELECT DISTINCT stage_1.name AS name, stage_1.department AS department" in query
 
 
 def test_cypher2oracle_sqlpgq_translates_with_match_join_on_multiple_variables():
@@ -1167,7 +1272,7 @@ def test_cypher2oracle_sqlpgq_translates_with_match_join_on_multiple_variables()
     assert "VERTEX_ID(u) AS u_VALUE" in query
     assert "stage_2.r_VALUE = stage_1.stage_1_r_VALUE" in query
     assert "stage_2.u_VALUE = stage_1.stage_1_u_VALUE" in query
-    assert "SELECT DISTINCT u, r" in query
+    assert "SELECT DISTINCT stage_1.u AS u, stage_1.r AS r" in query
 
 
 def test_cypher2oracle_sqlpgq_projects_carried_return_properties_from_first_with_stage():
@@ -1211,7 +1316,7 @@ def test_cypher2oracle_sqlpgq_maps_label_derived_id_for_carried_with_match_prope
     assert category == "Graph-IL Translatable"
     assert 's."infosource_id" AS source_id' in query
     assert 's."source_id"' not in query
-    assert "SELECT DISTINCT source_id, title" in query
+    assert "SELECT DISTINCT stage_1.source_id AS source_id, stage_1.title AS title" in query
 
 
 def test_cypher2oracle_sqlpgq_does_not_duplicate_redeclared_carried_vertex_return():
@@ -1225,7 +1330,7 @@ def test_cypher2oracle_sqlpgq_does_not_duplicate_redeclared_carried_vertex_retur
     stage_1 = query.split("stage_2 AS", 1)[0]
     assert "VERTEX_ID(nodes_1) AS stage_1_nodes_1_VALUE" in stage_1
     assert "VERTEX_ID(nodes_1) AS nodes_1_VALUE" not in stage_1
-    assert "SELECT nodes_2_VALUE, nodes_1_VALUE, edges_1_VALUE" in query
+    assert "SELECT nodes_2_VALUE, stage_1.stage_1_nodes_1_VALUE AS nodes_1_VALUE, edges_1_VALUE" in query
 
 
 def test_cypher2oracle_sqlpgq_translates_aggregate_with_match_stage_alias_aggregate():
@@ -1334,7 +1439,7 @@ def test_cypher2oracle_sqlpgq_translates_ordered_limited_with_match():
     assert "ORDER BY member_count DESC" in query
     assert "FETCH FIRST 3 ROWS ONLY" in query
     assert "JOIN stage_1 ON stage_2.g_VALUE = stage_1.stage_1_g_VALUE" in query
-    assert "SELECT group_name, user_name, last_login_date" in query
+    assert "SELECT stage_1.group_name AS group_name, stage_2.user_name AS user_name, stage_2.last_login_date AS last_login_date" in query
 
 
 def test_cypher2oracle_sqlpgq_projects_scalar_alias_in_ordered_with_match_stage():
@@ -1719,6 +1824,183 @@ def test_cypher2oracle_sqlpgq_translates_scalar_function_with_final_aggregate():
     assert "GROUP BY genre" in query
 
 
+def test_cypher2oracle_sqlpgq_translates_string_size_to_length():
+    query = _translate_sql("MATCH (q:Question) RETURN size(q.text) AS textLength")
+
+    assert 'LENGTH(q."text") AS textLength' in query
+
+
+def test_cypher2oracle_sqlpgq_translates_id_order_comparison():
+    query = _translate_sql(
+        "MATCH (m1:Movie)<-[:ACTED_IN]-(a:Actor)-[:ACTED_IN]->(m2:Movie) "
+        "WHERE id(m1) < id(m2) "
+        "RETURN m1.title, m2.title"
+    )
+
+    assert "WHERE VERTEX_ID(m1) < VERTEX_ID(m2)" in query
+    assert "WHERE id(" not in query.lower()
+
+
+def test_cypher2oracle_sqlpgq_rewrites_with_filter_element_equality_to_projected_ids():
+    query = _translate_sql(
+        "MATCH (neo4j:User {screen_name: 'neo4j'}) "
+        "MATCH (neo4j)-[:FOLLOWS]->(followed:User) "
+        "MATCH (mentioned:User)-[:POSTS]->(:Tweet)-[:MENTIONS]->(neo4j) "
+        "WITH DISTINCT followed, mentioned "
+        "WHERE followed = mentioned "
+        "RETURN followed.screen_name AS users"
+    )
+
+    assert "WHERE followed_VALUE = mentioned_VALUE" in query
+    assert "VERTEX_EQUAL(followed, mentioned)" not in query
+
+
+def test_cypher2oracle_sqlpgq_uses_second_stage_property_alias_when_final_alias_differs():
+    query = _translate_sql(
+        "MATCH (aa1:AdministrativeArea)-[:Borders]->(aa2:AdministrativeArea) "
+        "WITH aa1, COUNT(aa2) AS border_count "
+        "WHERE border_count >= 3 "
+        "MATCH (aa1)-[:ContainsPoi]->(poi:PointOfInterest) "
+        "RETURN poi.name, poi.category, aa1.name"
+    )
+
+    assert "poi.\"name\" AS name" in query
+    assert "SELECT stage_2.name AS poi" in query
+    assert "stage_2.poi" not in query
+
+
+def test_cypher2oracle_sqlpgq_translates_left_tostring_and_safe_numeric_division():
+    left_query = _translate_sql(
+        "MATCH (p1:Person)-[:FOLLOWS]->(p2:Person) "
+        "WHERE left(p1.name, 1) = left(p2.name, 1) "
+        "RETURN p1.name LIMIT 3"
+    )
+    assert 'SUBSTR(p1."name", 1, 1) = SUBSTR(p2."name", 1, 1)' in left_query
+    assert "left(" not in left_query.lower()
+
+    tostring_query = _translate_sql(
+        "MATCH (dd:DataDomain)<-[:BelongsTo]-(da:DataAsset) "
+        "WITH dd, AVG(TOFLOAT(REPLACE(da.schema_version, 'v', ''))) AS avg_schema_version "
+        "WHERE avg_schema_version > 2.0 "
+        "RETURN dd.name AS DomainName, 'v' + TOSTRING(avg_schema_version) AS AverageSchemaVersion"
+    )
+    assert "'v' || TO_CHAR(avg_schema_version) AS AverageSchemaVersion" in tostring_query
+    assert "TOSTRING" not in tostring_query
+
+    division_query = _translate_sql(
+        "MATCH (u:User) "
+        "WITH u, u.following / toFloat(u.followers) AS ratio "
+        "WHERE ratio > 2 "
+        "RETURN u.screen_name, ratio"
+    )
+    assert 'u."following" / NULLIF(TO_NUMBER(u."followers"), 0) AS ratio' in division_query
+
+
+def test_cypher2oracle_sqlpgq_translates_map_comparison_property_literals():
+    query = _translate_sql("MATCH ()-[:INTERACTS45 {weight: {lt: 10}}]->() RETURN count(*)")
+
+    assert 'e1."weight" < 10' in query
+    assert "{lt:" not in query
+
+
+def test_cypher2oracle_sqlpgq_translates_apoc_toset_collect_size_as_count_distinct():
+    query = _translate_sql(
+        "MATCH (p:Person)-[r:ACTED_IN]->(m:Movie) "
+        "WITH p, size(apoc.coll.toSet(collect(r.roles))) AS roleDiversity "
+        "RETURN p.name AS actor, roleDiversity ORDER BY roleDiversity DESC LIMIT 3"
+    )
+
+    assert "COUNT(DISTINCT roles) AS roleDiversity" in query
+    assert "apoc.coll.toSet" not in query
+
+
+def test_cypher2oracle_sqlpgq_auto_edge_names_avoid_future_node_names():
+    query = _translate_sql(
+        "MATCH (e1:Employee)-[:REQUESTS]->(a:Asset)<-[:REQUESTS]-(e2:Employee) "
+        "WHERE e1.name = 'Donald Schultz' AND e2.name <> 'Donald Schultz' "
+        "RETURN DISTINCT e2.name"
+    )
+
+    assert "(e1 IS \"Employee\")-[e3 IS \"REQUESTS\"]->(a IS \"Asset\")<-[e4 IS \"REQUESTS\"]-(e2 IS \"Employee\")" in query
+
+
+def test_cypher2oracle_sqlpgq_qualifies_carried_with_match_return_variables():
+    query = _translate_sql(
+        "MATCH (c:Customer)-[:Initiates]->(pt:PaymentTransaction)-[:ProcessedFor]->(m:Merchant) "
+        "WHERE m.category_code = 'Retail' "
+        "WITH c, pt "
+        "MATCH (pt)-[:HasRiskAssessment]->(ra:RiskAssessment) "
+        "WHERE ra.score > 70 "
+        "RETURN DISTINCT c LIMIT 10"
+    )
+
+    assert "SELECT DISTINCT stage_1.c_VALUE AS c" in query
+    assert "\nSELECT DISTINCT c\n" not in query
+
+
+def test_cypher2oracle_sqlpgq_orders_with_stage_by_expression_aliases():
+    query = _translate_sql(
+        "MATCH (p:Person)-[:CAST_FOR]->(m:Movie) "
+        "MATCH (p)-[:CAST_FOR]->(v:Video) "
+        "WITH p, COUNT(DISTINCT m) AS movie_count, COUNT(DISTINCT v) AS video_count "
+        "WHERE movie_count > 0 AND video_count > 0 "
+        "RETURN p.name AS actor, movie_count, video_count "
+        "ORDER BY movie_count + video_count DESC LIMIT 3"
+    )
+
+    assert "ORDER BY movie_count + video_count DESC" in query
+    assert "movie_count_video_count" not in query
+
+
+def test_cypher2oracle_sqlpgq_groups_direct_with_projection_final_aggregate():
+    query = _translate_sql(
+        "MATCH (u:User)-[:WROTE]->(r:Review)-[:REVIEWS]->(b:Business) "
+        "WITH b.city AS city, r.stars AS stars "
+        "RETURN city, avg(stars) AS averageRating"
+    )
+
+    assert "SELECT city AS city, AVG(stars) AS averageRating" in query
+    assert "GROUP BY city" in query
+
+
+def test_cypher2oracle_sqlpgq_translates_complex_optional_aggregate_expression():
+    query = _translate_sql(
+        "MATCH (t:Tweet) "
+        "OPTIONAL MATCH (t)-[:RETWEETS]->(r:Tweet) "
+        "RETURN t, t.favorites + count(r) AS score ORDER BY score DESC LIMIT 3"
+    )
+
+    assert 'stage_1.t_favorites + count(stage_2.r_VALUE) AS score' in query
+    assert 't."favorites" + count(r)' not in query
+    assert "GROUP BY stage_1.stage_1_t_VALUE, stage_1.t_favorites" in query
+
+
+def test_cypher2oracle_sqlpgq_translates_complex_with_match_count_expression():
+    query = _translate_sql(
+        "MATCH (pc:ProductionCompany)<-[:PRODUCED_BY]-(m1:Movie)-[:DIRECTED_BY]->(d:Director {name: 'Director 15'}) "
+        "WITH pc, m1 "
+        "MATCH (pc)<-[:PRODUCED_BY]-(m2:Movie)-[:BELONGS_TO]->(g:Genre {name: 'Horror'}) "
+        "RETURN pc.name AS ProductionCompany, COUNT(DISTINCT m1) + COUNT(DISTINCT m2) AS TotalDistinctMovies"
+    )
+
+    assert "VERTEX_ID(m2) AS m2_VALUE" in query
+    assert "COUNT(DISTINCT stage_1.stage_1_m1_VALUE) + COUNT(DISTINCT stage_2.m2_VALUE) AS TotalDistinctMovies" in query
+
+
+def test_cypher2oracle_sqlpgq_projects_properties_from_aliased_with_vertex():
+    query = _translate_sql(
+        "MATCH (c1:Character) WHERE c1.community = 735 "
+        "MATCH (c1)--(c2:Character) "
+        "WITH DISTINCT c2 AS character, c2.book1PageRank AS pageRank "
+        "ORDER BY pageRank DESC LIMIT 10 "
+        "RETURN character.name AS characterName, pageRank"
+    )
+
+    assert 'c2."name" AS character_name' in query
+    assert "SELECT character_name AS characterName, pageRank AS pageRank" in query
+    assert "character.name" not in query
+
+
 def test_cypher2oracle_sqlpgq_translates_passthrough_with_final_aggregate():
     query = _translate_sql(
         "MATCH (g:Group)<-[:BelongsTo]-(u:User {department: 'Finance'})"
@@ -2063,7 +2345,7 @@ def test_cypher2oracle_sqlpgq_translates_match_optional_with_count_left_join():
     assert "LEFT JOIN stage_2 ON stage_2.q_VALUE = stage_1.stage_1_q_VALUE" in query
     assert "stage_1.stage_1_q_VALUE AS q_VALUE" in query
     assert "COUNT(stage_2.c_VALUE) AS commentCount" in query
-    assert "GROUP BY stage_2.q_VALUE, stage_1.q_title" in query
+    assert "GROUP BY stage_1.stage_1_q_VALUE, stage_1.q_title" in query
 
 
 def test_cypher2oracle_sqlpgq_carries_base_only_variable_in_match_optional_with():
@@ -2081,7 +2363,7 @@ def test_cypher2oracle_sqlpgq_carries_base_only_variable_in_match_optional_with(
     assert "GROUP BY stage_1.categoryName" in query
 
 
-def test_cypher2oracle_sqlpgq_translates_optional_null_antijoin():
+def test_cypher2oracle_sqlpgq_keeps_optional_null_where_in_optional_stage():
     query = _translate_sql(
         "MATCH (q:Question) "
         "OPTIONAL MATCH (q)<-[:COMMENTED_ON]-(c:Comment) "
@@ -2089,7 +2371,7 @@ def test_cypher2oracle_sqlpgq_translates_optional_null_antijoin():
         "RETURN q.title"
     )
 
-    assert "WHERE NOT EXISTS" in query
+    assert "LEFT JOIN stage_2 ON stage_2.q_VALUE = stage_1.stage_1_q_VALUE" in query
     assert 'MATCH (c IS "Comment")-[e1 IS "COMMENTED_ON"]->(q)' in query
-    assert "pp.q_VALUE = base.q_VALUE" in query
+    assert "WHERE c IS NULL" in query
     assert "OPTIONAL MATCH" not in query

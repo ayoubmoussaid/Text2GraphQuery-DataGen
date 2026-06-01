@@ -44,6 +44,7 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         self._path_variable_has_quantifier: Dict[str, bool] = {}
         self._path_variable_quantified_edges: Dict[str, set[str]] = {}
         self._var_property_redirects: Dict[Tuple[str, str], str] = {}
+        self._reserved_variables: set[str] = set()
         self._pattern_where_expressions: List[str] = []
         self._auto_node_index = 0
         self._auto_edge_index = 0
@@ -67,6 +68,11 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
 
     def translate(self, query_pattern: List[Clause]) -> str:
         self._reset()
+        if any(
+            isinstance(clause, MatchClause) and clause.optional
+            for clause in query_pattern
+        ):
+            return self._translate_optional_match(query_pattern)
         if any(isinstance(clause, WithClause) for clause in query_pattern):
             return self._translate_supported_with(query_pattern)
         match_clauses: List[MatchClause] = []
@@ -297,6 +303,61 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             if match:
                 predicates[index] = (bool(match.group("not")), match.group("pattern"))
         return predicates
+
+    def _translate_optional_match(self, query_pattern: List[Clause]) -> str:
+        optional_indexes = [
+            index
+            for index, clause in enumerate(query_pattern)
+            if isinstance(clause, MatchClause) and clause.optional
+        ]
+        if len(optional_indexes) != 1:
+            raise ValueError("Only one OPTIONAL MATCH clause is supported.")
+
+        optional_index = optional_indexes[0]
+        if optional_index == 0:
+            raise ValueError("Standalone OPTIONAL MATCH is not supported by Graph IR translation.")
+
+        if any(
+            isinstance(clause, MatchClause)
+            for clause in query_pattern[optional_index + 1 :]
+        ):
+            raise ValueError("OPTIONAL MATCH must be the final MATCH stage.")
+
+        before_optional = query_pattern[:optional_index]
+        if not any(isinstance(clause, MatchClause) for clause in before_optional):
+            raise ValueError("OPTIONAL MATCH requires a preceding MATCH.")
+
+        if any(isinstance(clause, WithClause) for clause in before_optional):
+            return self._translate_supported_with(query_pattern)
+
+        carried_variables = sorted(
+            self._declared_variables_in_match_clauses(
+                [clause for clause in before_optional if isinstance(clause, MatchClause)]
+            )
+        )
+        if not carried_variables:
+            raise ValueError("OPTIONAL MATCH requires named variables to carry forward.")
+
+        synthetic_with = WithClause(
+            ReturnBody(
+                [
+                    ReturnItem(
+                        symbolic_name=variable,
+                        property="",
+                        alias="",
+                        function_name="",
+                        expression=variable,
+                    )
+                    for variable in carried_variables
+                ],
+                [],
+            ),
+            [],
+            False,
+        )
+        return self._translate_supported_with(
+            [*before_optional, synthetic_with, *query_pattern[optional_index:]]
+        )
 
     def _translate_return_pattern_predicate_cte(
         self,
@@ -1358,6 +1419,9 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         second_match_clauses = [
             clause for clause in after_with if isinstance(clause, MatchClause)
         ]
+        optional_second_stage = any(clause.optional for clause in second_match_clauses)
+        if optional_second_stage and not all(clause.optional for clause in second_match_clauses):
+            raise ValueError("OPTIONAL MATCH cannot be mixed with regular MATCH in one stage.")
         second_where_expressions: List[CompareExpression] = []
         return_clauses = []
         for clause in after_with:
@@ -1559,7 +1623,7 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             second_graph_table_parts.append("WHERE " + " AND ".join(second_where_parts))
 
         aggregate_query = self._has_aggregate(return_clause.return_body)
-        if aggregate_query and not stage_one_aliases:
+        if not stage_one_aliases:
             stage_one_aliases = nonstaged_stage_one_aliases
         cross_join = (
             not join_variables
@@ -1582,6 +1646,8 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             and not cross_join
         ):
             raise ValueError("WITH MATCH pipeline has no carried variables in second MATCH.")
+        if optional_second_stage and cross_join:
+            raise ValueError("OPTIONAL MATCH requires correlation to prior bindings.")
         second_return_body = self._return_body_for_second_match_stage(
             return_clause.return_body,
             join_variables,
@@ -1654,11 +1720,15 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             f"{self._indent_sql(second_stage_query)}\n"
             ")\n"
             f"{final_select}\n"
-            "FROM stage_2\n"
             + (
-                "CROSS JOIN stage_1"
-                if cross_join
-                else "JOIN stage_1 ON " + " AND ".join(join_conditions)
+                "FROM stage_1\nLEFT JOIN stage_2 ON " + " AND ".join(join_conditions)
+                if optional_second_stage
+                else "FROM stage_2\n"
+                + (
+                    "CROSS JOIN stage_1"
+                    if cross_join
+                    else "JOIN stage_1 ON " + " AND ".join(join_conditions)
+                )
             )
         )
         query += self._outer_group_order_and_paging_for_with_match(
@@ -1726,6 +1796,14 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                     group_aliases.append(f"stage_1.{OracleNameSanitizer.alias(resolved_alias)}")
                 else:
                     group_aliases.append(f"stage_2.{OracleNameSanitizer.alias(resolved_alias)}")
+            for item in return_body.return_item_list:
+                if not self._is_complex_aggregate_item(item):
+                    continue
+                for variable, property_name in self._property_references(item.expression):
+                    property_name = self._canonical_property_name(variable, property_name)
+                    property_alias = self._with_property_stage_alias(variable, property_name)
+                    if property_alias in stage_one_aliases:
+                        group_aliases.append(f"stage_1.{property_alias}")
             if group_aliases:
                 suffix += "\nGROUP BY " + ", ".join(dict.fromkeys(group_aliases))
         if return_body.sort_item_list:
@@ -1813,6 +1891,23 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             return_body.limit,
         )
         stage_body = self._return_body_with_join_variables(stage_body, join_variables)
+        aggregate_element_references = []
+        for item in return_body.return_item_list:
+            aggregate_element_references.extend(
+                variable
+                for variable in self._aggregate_element_references(item.expression)
+                if variable in second_declared_variables
+            )
+        for sort_item in return_body.sort_item_list:
+            aggregate_element_references.extend(
+                variable
+                for variable in self._aggregate_element_references(sort_item.expression)
+                if variable in second_declared_variables
+            )
+        stage_body = self._return_body_with_join_variables(
+            stage_body,
+            list(dict.fromkeys(aggregate_element_references)),
+        )
         stage_body = self._return_body_with_join_variables(
             stage_body,
             [second_variable for second_variable, _operator, _first_variable in element_correlations],
@@ -1909,7 +2004,10 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         return_aliases = self._resolved_return_aliases(return_body)
         for item, resolved_alias in zip(return_body.return_item_list, return_aliases, strict=True):
             if self._is_complex_aggregate_item(item):
-                expression = self._translate_sql_expression(item.expression)
+                expression = self._outer_complex_aggregate_expression_for_with_match(
+                    item.expression,
+                    stage_one_aliases,
+                )
                 alias = self._return_alias(item, expression)
                 select_items.append(f"{expression} AS {OracleNameSanitizer.alias(alias)}")
             elif self._is_aggregate_item(item):
@@ -1931,7 +2029,7 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                 elif resolved_sql_alias in stage_one_aliases:
                     expression = f"stage_1.{resolved_sql_alias}"
                 else:
-                    expression = f"stage_2.{resolved_sql_alias}"
+                    expression = f"stage_2.{stage_alias}"
                 select_items.append(f"{expression} AS {resolved_sql_alias}")
             elif item.expression and (
                 item.expression != item.symbolic_name
@@ -1960,6 +2058,36 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                 )
         keyword = "SELECT DISTINCT" if distinct else "SELECT"
         return f"{keyword} " + ", ".join(select_items)
+
+    def _outer_complex_aggregate_expression_for_with_match(
+        self,
+        expression: str,
+        stage_one_aliases: set[str],
+    ) -> str:
+        translated = self._translate_sql_expression(expression)
+        translated = self._outer_expression_for_with_match(translated, stage_one_aliases)
+        for variable in self._aggregate_element_reference_names(expression):
+            stage_one_element_alias = self._stage_one_join_alias(variable)
+            element_alias = self._element_projection_alias(variable)
+            if stage_one_element_alias in stage_one_aliases:
+                qualified = f"stage_1.{stage_one_element_alias}"
+            elif element_alias in stage_one_aliases:
+                qualified = f"stage_1.{element_alias}"
+            else:
+                qualified = f"stage_2.{element_alias}"
+            translated = re.sub(
+                rf"\b(COUNT)\s*\(\s*DISTINCT\s+{re.escape(variable)}\s*\)",
+                rf"\1(DISTINCT {qualified})",
+                translated,
+                flags=re.IGNORECASE,
+            )
+            translated = re.sub(
+                rf"\b(COUNT|MIN|MAX)\s*\(\s*{re.escape(variable)}\s*\)",
+                rf"\1({qualified})",
+                translated,
+                flags=re.IGNORECASE,
+            )
+        return self._coalesce_sum_calls(translated)
 
     def _outer_expression_for_with_match(
         self,
@@ -2011,16 +2139,6 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                     distinct,
                     f"stage_1.{property_alias}",
                 )
-        if (
-            symbolic_name in self._var_kinds
-            and not item.property
-            and "." not in argument
-        ):
-            distinct = "DISTINCT " if self._has_distinct_prefix(item.symbolic_name) else ""
-            return (
-                f"{function_name}({distinct}"
-                f"stage_2.{self._element_projection_alias(symbolic_name)})"
-            )
         stage_one_element_alias = self._stage_one_join_alias(symbolic_name)
         if (
             not item.property
@@ -2032,6 +2150,16 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                 function_name,
                 distinct,
                 f"stage_1.{stage_one_element_alias}",
+            )
+        if (
+            symbolic_name in self._var_kinds
+            and not item.property
+            and "." not in argument
+        ):
+            distinct = "DISTINCT " if self._has_distinct_prefix(item.symbolic_name) else ""
+            return (
+                f"{function_name}({distinct}"
+                f"stage_2.{self._element_projection_alias(symbolic_name)})"
             )
         argument = self._translate_sql_expression(argument)
         argument_alias = OracleNameSanitizer.alias(argument)
@@ -2063,6 +2191,9 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             element_alias = self._element_projection_alias(item.symbolic_name)
             if element_alias in stage_one_aliases:
                 return element_alias
+            stage_one_element_alias = self._stage_one_join_alias(item.symbolic_name)
+            if stage_one_element_alias in stage_one_aliases:
+                return stage_one_element_alias
         return OracleNameSanitizer.alias(
             getattr(item, "alias", "")
             or item.property
@@ -2538,7 +2669,12 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
     ) -> set[str]:
         variables = set()
         for clause in match_clauses:
-            for path in clause.path_pattern:
+            paths = (
+                clause.path_pattern
+                if isinstance(clause.path_pattern, list)
+                else [clause.path_pattern]
+            )
+            for path in paths:
                 for node in path.node_pattern_list:
                     if node.symbolic_name:
                         variables.add(node.symbolic_name)
@@ -2578,12 +2714,53 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                 )
             )
             existing_aliases.add(alias)
+        graph_aliases = self._with_graph_aliases(with_body)
+        aliased_property_references: List[Tuple[str, str]] = []
+        for item in final_body.return_item_list:
+            if item.property:
+                aliased_property_references.append((item.symbolic_name, item.property))
+            aliased_property_references.extend(self._all_property_references(item.expression))
+        for sort_item in final_body.sort_item_list:
+            if sort_item.property:
+                aliased_property_references.append((sort_item.symbolic_name, sort_item.property))
+            aliased_property_references.extend(self._all_property_references(sort_item.expression))
+        for alias_variable, property_name in dict.fromkeys(aliased_property_references):
+            source_variable = graph_aliases.get(alias_variable)
+            if not source_variable or source_variable not in carried_variables:
+                continue
+            property_name = self._canonical_property_name(source_variable, property_name)
+            alias = self._with_property_stage_alias(alias_variable, property_name)
+            if alias in existing_aliases:
+                continue
+            items.append(
+                ReturnItem(
+                    symbolic_name=source_variable,
+                    property=property_name,
+                    alias=alias,
+                    function_name="",
+                    expression=f"{source_variable}.{property_name}",
+                )
+            )
+            existing_aliases.add(alias)
         return ReturnBody(
             items,
             with_body.sort_item_list,
             with_body.skip,
             with_body.limit,
         )
+
+    def _with_graph_aliases(self, with_body: ReturnBody) -> Dict[str, str]:
+        aliases: Dict[str, str] = {}
+        for item in with_body.return_item_list:
+            if (
+                item.alias
+                and not item.property
+                and not item.function_name
+                and (not item.expression or item.expression == item.symbolic_name)
+                and item.symbolic_name in self._var_kinds
+            ):
+                aliases[item.alias] = item.symbolic_name
+        return aliases
 
     def _with_stage_needed_properties(
         self,
@@ -2683,6 +2860,9 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             elif item.property and item.symbolic_name in carried_variables:
                 expression = self._with_property_stage_alias(item.symbolic_name, item.property)
                 alias = item.alias or item.property
+            elif item.property:
+                expression = self._with_property_stage_alias(item.symbolic_name, item.property)
+                alias = item.alias or item.property
             elif not item.property and item.symbolic_name in carried_variables:
                 expression = self._element_projection_alias(item.symbolic_name)
                 alias = item.alias or item.symbolic_name
@@ -2752,18 +2932,56 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                 expression,
             )
         for variable in carried_variables:
+            element_alias = self._element_projection_alias(variable)
+            expression = re.sub(
+                rf"\b(VERTEX_ID|EDGE_ID)\s*\(\s*{re.escape(variable)}\s*\)",
+                element_alias,
+                expression,
+                flags=re.IGNORECASE,
+            )
             expression = re.sub(
                 rf"\b(COUNT)\s*\(\s*DISTINCT\s+{re.escape(variable)}\s*\)",
-                rf"\1(DISTINCT {self._element_projection_alias(variable)})",
+                rf"\1(DISTINCT {element_alias})",
                 expression,
                 flags=re.IGNORECASE,
             )
             expression = re.sub(
                 rf"\b(COUNT|MIN|MAX)\s*\(\s*{re.escape(variable)}\s*\)",
-                rf"\1({self._element_projection_alias(variable)})",
+                rf"\1({element_alias})",
                 expression,
                 flags=re.IGNORECASE,
             )
+        variables = sorted(carried_variables, key=len, reverse=True)
+        for left in variables:
+            for right in variables:
+                comparison = (
+                    f"{self._element_projection_alias(left)} = "
+                    f"{self._element_projection_alias(right)}"
+                )
+                expression = re.sub(
+                    rf"\bNOT\s+VERTEX_EQUAL\s*\(\s*{re.escape(left)}\s*,\s*{re.escape(right)}\s*\)",
+                    f"{self._element_projection_alias(left)} <> {self._element_projection_alias(right)}",
+                    expression,
+                    flags=re.IGNORECASE,
+                )
+                expression = re.sub(
+                    rf"\bNOT\s+EDGE_EQUAL\s*\(\s*{re.escape(left)}\s*,\s*{re.escape(right)}\s*\)",
+                    f"{self._element_projection_alias(left)} <> {self._element_projection_alias(right)}",
+                    expression,
+                    flags=re.IGNORECASE,
+                )
+                expression = re.sub(
+                    rf"\bVERTEX_EQUAL\s*\(\s*{re.escape(left)}\s*,\s*{re.escape(right)}\s*\)",
+                    comparison,
+                    expression,
+                    flags=re.IGNORECASE,
+                )
+                expression = re.sub(
+                    rf"\bEDGE_EQUAL\s*\(\s*{re.escape(left)}\s*,\s*{re.escape(right)}\s*\)",
+                    comparison,
+                    expression,
+                    flags=re.IGNORECASE,
+                )
         return expression
 
     def _with_filters(self, with_clause: WithClause, carried_variables: set[str]) -> List[str]:
@@ -2855,6 +3073,14 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
 
     def _outer_order_and_paging_for_with(self, return_body: ReturnBody) -> str:
         suffix = ""
+        if self._has_aggregate(return_body):
+            group_aliases = [
+                OracleNameSanitizer.alias(item.alias or item.property or item.symbolic_name)
+                for item in return_body.return_item_list
+                if not self._is_aggregate_item(item)
+            ]
+            if group_aliases:
+                suffix += "\nGROUP BY " + ", ".join(dict.fromkeys(group_aliases))
         if return_body.sort_item_list:
             suffix += "\nORDER BY " + ", ".join(
                 self._translate_sort_item(item, return_body) for item in return_body.sort_item_list
@@ -2873,6 +3099,7 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         self._path_variable_has_quantifier = {}
         self._path_variable_quantified_edges = {}
         self._var_property_redirects = {}
+        self._reserved_variables = set()
         self._pattern_where_expressions = []
         self._auto_node_index = 0
         self._auto_edge_index = 0
@@ -2893,6 +3120,16 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         return self._translate_path_pattern(path_pattern)
 
     def _translate_path_pattern(self, path_pattern: PathPattern) -> str:
+        self._reserved_variables.update(
+            node.symbolic_name
+            for node in path_pattern.node_pattern_list
+            if node.symbolic_name
+        )
+        self._reserved_variables.update(
+            edge.symbolic_name
+            for edge in path_pattern.edge_pattern_list
+            if edge.symbolic_name
+        )
         if path_pattern.edge_pattern_list and all(
             edge.direction == "left" for edge in path_pattern.edge_pattern_list
         ):
@@ -3090,6 +3327,15 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         for property_name, property_value in property_maps:
             property_name = self._canonical_property_name(variable, property_name)
             property_ref = OracleNameSanitizer.quote(property_name, fallback="PROP")
+            map_comparison = self._property_map_comparison(
+                variable,
+                property_name,
+                property_value,
+            )
+            if map_comparison:
+                operator, comparison_value = map_comparison
+                expressions.append(f"{variable}.{property_ref} {operator} {comparison_value}")
+                continue
             property_value = self._coerce_literal_for_property(
                 variable,
                 property_name,
@@ -3099,6 +3345,34 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                 f"{variable}.{property_ref} = {property_value}"
             )
         return " AND ".join(expressions)
+
+    def _property_map_comparison(
+        self,
+        variable: str,
+        property_name: str,
+        value: str,
+    ) -> Tuple[str, str] | None:
+        match = re.fullmatch(
+            r"\{\s*(?P<operator>lt|lte|gt|gte|eq|neq)\s*:\s*(?P<value>.+?)\s*\}",
+            str(value or "").strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        operator = {
+            "lt": "<",
+            "lte": "<=",
+            "gt": ">",
+            "gte": ">=",
+            "eq": "=",
+            "neq": "<>",
+        }[match.group("operator").lower()]
+        comparison_value = self._coerce_literal_for_property(
+            variable,
+            property_name,
+            match.group("value"),
+        )
+        return operator, comparison_value
 
     def _coerce_literal_for_property(
         self,
@@ -3759,6 +4033,13 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                 )
 
     def _translate_collect_size_aggregate_expression(self, expression: str) -> str:
+        expression = re.sub(
+            r"\bsize\s*\(\s*apoc\.coll\.toSet\s*\(\s*collect\s*\(\s*"
+            r"(?P<body>[^()]+?)\s*\)\s*\)\s*\)",
+            lambda match: f"COUNT(DISTINCT {match.group('body').strip()})",
+            expression or "",
+            flags=re.IGNORECASE,
+        )
         return re.sub(
             r"\bsize\s*\(\s*collect\s*\(\s*(?P<distinct>distinct\s+)?"
             r"(?P<body>[^()]+?)\s*\)\s*\)",
@@ -3789,6 +4070,13 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         return aliases
 
     def _aggregate_element_references(self, expression: str) -> List[str]:
+        return [
+            variable
+            for variable in self._aggregate_element_reference_names(expression)
+            if variable in self._var_kinds
+        ]
+
+    def _aggregate_element_reference_names(self, expression: str) -> List[str]:
         protected, _ = self._protect_string_literals(expression or "")
         variables: List[str] = []
         for match in re.finditer(
@@ -3797,9 +4085,7 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             protected,
             flags=re.IGNORECASE,
         ):
-            variable = match.group("variable")
-            if variable in self._var_kinds:
-                variables.append(variable)
+            variables.append(match.group("variable"))
         return list(dict.fromkeys(variables))
 
     def _element_projection_alias(self, variable: str) -> str:
@@ -3849,6 +4135,12 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         return_body: ReturnBody,
         carried_variables: set[str],
     ) -> str:
+        if sort_item.expression:
+            alias = self._with_stage_expression(
+                self._translate_sql_expression(sort_item.expression),
+                carried_variables,
+            )
+            return f"{alias}{self._sql_sort_order(sort_item.order)}"
         if sort_item.property and sort_item.symbolic_name in carried_variables:
             alias = self._with_property_stage_alias(
                 sort_item.symbolic_name,
@@ -4031,6 +4323,7 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         protected = self._coerce_typed_property_comparisons(protected)
         protected = self._coerce_date_function_property_comparisons(protected)
         protected = self._translate_element_id_comparisons(protected)
+        protected = self._translate_id_function_calls(protected)
         protected = self._translate_element_comparisons(protected)
         protected = self._translate_split_size(protected, literals)
         protected = self._translate_modulo(protected)
@@ -4038,8 +4331,12 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         protected = re.sub(r"(?<!')\bfalse\b(?!')", "0", protected, flags=re.IGNORECASE)
         protected = re.sub(r"\bsize\s*\(", "LENGTH(", protected, flags=re.IGNORECASE)
         protected = re.sub(r"\btoFloat\s*\(", "TO_NUMBER(", protected, flags=re.IGNORECASE)
+        protected = re.sub(r"\btoString\s*\(", "TO_CHAR(", protected, flags=re.IGNORECASE)
         protected = self._translate_to_integer(protected)
         protected = self._translate_substring(protected)
+        protected = self._translate_left_function(protected)
+        protected = self._guard_numeric_division(protected)
+        protected = self._translate_string_concatenation(protected)
         protected = self._translate_modulo(protected)
         protected = re.sub(r"\bCOUNT\s*\(\s*\)", "COUNT(*)", protected, flags=re.IGNORECASE)
         protected = self._restore_string_literals(protected, literals)
@@ -4193,6 +4490,47 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             flags=re.IGNORECASE,
         )
 
+    def _translate_left_function(self, expression: str) -> str:
+        def replace(match: re.Match) -> str:
+            return f"SUBSTR({match.group('value')}, 1, {match.group('length')})"
+
+        return re.sub(
+            r"\bleft\s*\(\s*(?P<value>[^,]+)\s*,\s*(?P<length>[^()]+)\)",
+            replace,
+            expression,
+            flags=re.IGNORECASE,
+        )
+
+    def _guard_numeric_division(self, expression: str) -> str:
+        return re.sub(
+            r"/\s*(TO_NUMBER\([^)]+\))",
+            lambda match: f"/ NULLIF({match.group(1)}, 0)",
+            expression,
+            flags=re.IGNORECASE,
+        )
+
+    def _translate_string_concatenation(self, expression: str) -> str:
+        operand = r"(?:__SQL_LITERAL_\d+__|TO_CHAR\([^)]+\)|[A-Za-z_][A-Za-z0-9_]*)"
+        previous = None
+        while previous != expression:
+            previous = expression
+            expression = re.sub(
+                rf"(?P<left>{operand})\s*\+\s*(?P<right>{operand})",
+                lambda match: (
+                    f"{match.group('left')} || {match.group('right')}"
+                    if (
+                        match.group("left").startswith("__SQL_LITERAL_")
+                        or match.group("right").startswith("__SQL_LITERAL_")
+                        or match.group("left").upper().startswith("TO_CHAR(")
+                        or match.group("right").upper().startswith("TO_CHAR(")
+                    )
+                    else match.group(0)
+                ),
+                expression,
+                flags=re.IGNORECASE,
+            )
+        return expression
+
     def _matching_paren_index(self, expression: str, open_index: int) -> int:
         depth = 0
         index = open_index
@@ -4271,7 +4609,7 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
                     f"CASE WHEN {body} IS NULL OR {body} = '' THEN 0 "
                     f"ELSE REGEXP_COUNT({body}, ',') + 1 END"
                 )
-            return f"REGEXP_COUNT({body}, '\\\\S+')"
+            return f"REGEXP_COUNT({body}, '\\S+')"
 
         return re.sub(
             r"\bsize\s*\(\s*split\s*\((?P<body>[^,]+),\s*"
@@ -4447,6 +4785,20 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
             r"\bid\s*\(\s*(?P<left>[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*"
             r"(?P<operator>=|<>)\s*"
             r"id\s*\(\s*(?P<right>[A-Za-z_][A-Za-z0-9_]*)\s*\)",
+            replace,
+            expression,
+            flags=re.IGNORECASE,
+        )
+
+    def _translate_id_function_calls(self, expression: str) -> str:
+        def replace(match: re.Match) -> str:
+            variable = match.group("variable")
+            if variable not in self._var_kinds:
+                return match.group(0)
+            return self._element_id_expression(variable)
+
+        return re.sub(
+            r"\bid\s*\(\s*(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\s*\)",
             replace,
             expression,
             flags=re.IGNORECASE,
@@ -4630,12 +4982,12 @@ class OracleSqlPgqQueryTranslator(QueryTranslator):
         while True:
             self._auto_node_index += 1
             variable = f"n{self._auto_node_index}"
-            if variable not in self._var_kinds:
+            if variable not in self._var_kinds and variable not in self._reserved_variables:
                 return variable
 
     def _next_edge_var(self) -> str:
         while True:
             self._auto_edge_index += 1
             variable = f"e{self._auto_edge_index}"
-            if variable not in self._var_kinds:
+            if variable not in self._var_kinds and variable not in self._reserved_variables:
                 return variable

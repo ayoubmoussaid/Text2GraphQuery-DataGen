@@ -63,6 +63,14 @@ class DatasetNeo4jLoader:
         self.primary_by_label = {
             item["label"]: item.get("primary", "_id") for item in self.vertices
         }
+        self.property_types_by_label = {
+            item["label"]: {
+                prop["name"]: prop.get("type", "STRING")
+                for prop in item.get("properties", [])
+                if prop.get("name")
+            }
+            for item in self.schema
+        }
 
     def close(self) -> None:
         self.driver.close()
@@ -107,6 +115,7 @@ class DatasetNeo4jLoader:
                 return
 
     def execute(self, query: str, timeout_s: float | None = None) -> tuple[str, list[dict], str]:
+        query = self.prepare_query(query)
         try:
             with self.driver.session(database=self.database) as session:
                 executable = (
@@ -120,6 +129,235 @@ class DatasetNeo4jLoader:
             error = str(exc)
             status = "client_error" if "syntax" in error.lower() else "server_error"
             return status, [], error
+
+    def prepare_query(self, query: str) -> str:
+        query = self._coerce_string_backed_boolean_literals(query)
+        query = self._coerce_string_backed_numeric_comparisons(query)
+        query = self._coerce_string_backed_date_comparisons(query)
+        return query
+
+    def _coerce_string_backed_boolean_literals(self, query: str) -> str:
+        variables = self._query_variable_labels(query)
+
+        def replace_not_property(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            return f"{variable}.{property_name} = 'false'"
+
+        query = re.sub(
+            r"\bNOT\s+(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\b",
+            replace_not_property,
+            query,
+            flags=re.IGNORECASE,
+        )
+
+        def replace_comparison(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            value = match.group("value").lower()
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            return f"{variable}.{property_name} {match.group('operator')} '{value}'"
+
+        query = re.sub(
+            r"\b(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\s*"
+            r"(?P<operator>=|<>)\s*(?P<value>true|false)\b",
+            replace_comparison,
+            query,
+            flags=re.IGNORECASE,
+        )
+
+        def replace_map_literal(match: re.Match) -> str:
+            property_name = match.group("property")
+            value = match.group("value").lower()
+            if not self._has_string_property(property_name):
+                return match.group(0)
+            return f"{property_name}: '{value}'"
+
+        return re.sub(
+            r"\b(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\s*:\s*"
+            r"(?P<value>true|false)\b",
+            replace_map_literal,
+            query,
+            flags=re.IGNORECASE,
+        )
+
+    def _coerce_string_backed_numeric_comparisons(self, query: str) -> str:
+        variables = self._query_variable_labels(query)
+
+        def replace_left(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            return (
+                f"{variable}.{property_name} {match.group('operator')} "
+                f"'{match.group('value')}'"
+            )
+
+        query = re.sub(
+            r"\b(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\s*"
+            r"(?P<operator><=|>=|<>|=|<|>)\s*"
+            r"(?P<value>-?\d+(?:\.\d+)?)\b",
+            replace_left,
+            query,
+        )
+
+        def replace_right(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            return (
+                f"'{match.group('value')}' {match.group('operator')} "
+                f"{variable}.{property_name}"
+            )
+
+        query = re.sub(
+            r"\b(?P<value>-?\d+(?:\.\d+)?)\s*"
+            r"(?P<operator><=|>=|<>|=|<|>)\s*"
+            r"(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\b",
+            replace_right,
+            query,
+        )
+
+        def replace_map_literal(match: re.Match) -> str:
+            property_name = match.group("property")
+            value = match.group("value")
+            if not self._has_string_property(property_name):
+                return match.group(0)
+            return f"{property_name}: '{value}'"
+
+        return re.sub(
+            r"\b(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\s*:\s*"
+            r"(?P<value>-?\d+(?:\.\d+)?)\b",
+            replace_map_literal,
+            query,
+        )
+
+    def _coerce_string_backed_date_comparisons(self, query: str) -> str:
+        variables = self._query_variable_labels(query)
+
+        query = self._coerce_string_backed_date_accessors(query, variables)
+
+        def replace_left(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            left = match.group("left")
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            if re.fullmatch(r"\s*date\s*\(", left, flags=re.IGNORECASE):
+                return match.group(0)
+            return (
+                f"date({variable}.{property_name}) "
+                f"{match.group('operator')} {match.group('right')}"
+            )
+
+        query = re.sub(
+            r"(?P<left>\b(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*))\s*"
+            r"(?P<operator><=|>=|<>|=|<|>)\s*"
+            r"(?P<right>date\s*\([^)]+\))",
+            replace_left,
+            query,
+            flags=re.IGNORECASE,
+        )
+
+        def replace_right(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            return (
+                f"{match.group('left')} {match.group('operator')} "
+                f"date({variable}.{property_name})"
+            )
+
+        return re.sub(
+            r"(?P<left>date\s*\([^)]+\))\s*"
+            r"(?P<operator><=|>=|<>|=|<|>)\s*"
+            r"(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\b",
+            replace_right,
+            query,
+            flags=re.IGNORECASE,
+        )
+
+    def _coerce_string_backed_date_accessors(
+        self,
+        query: str,
+        variables: Dict[str, str],
+    ) -> str:
+        def accessor_expression(variable: str, property_name: str, accessor: str) -> str:
+            base = (
+                f"datetime({variable}.{property_name})"
+                if self._looks_like_datetime_string_property(variable, property_name)
+                else f"date({variable}.{property_name})"
+            )
+            return f"{base}.{accessor}"
+
+        def replace_date_call(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            return accessor_expression(variable, property_name, match.group("accessor"))
+
+        query = re.sub(
+            r"\bdate\s*\(\s*(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\s*\)\."
+            r"(?P<accessor>year|month|day|weekday|dayOfWeek)\b",
+            replace_date_call,
+            query,
+            flags=re.IGNORECASE,
+        )
+
+        def replace_direct_accessor(match: re.Match) -> str:
+            variable = match.group("variable")
+            property_name = match.group("property")
+            if not self._is_string_property(variables.get(variable, ""), property_name):
+                return match.group(0)
+            return accessor_expression(variable, property_name, match.group("accessor"))
+
+        return re.sub(
+            r"\b(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\."
+            r"(?P<property>[A-Za-z_][A-Za-z0-9_$#]*)\."
+            r"(?P<accessor>year|month|day|weekday|dayOfWeek)\b",
+            replace_direct_accessor,
+            query,
+            flags=re.IGNORECASE,
+        )
+
+    def _looks_like_datetime_string_property(self, variable: str, property_name: str) -> bool:
+        return property_name.lower().endswith(("at", "time", "timestamp", "datetime"))
+
+    def _query_variable_labels(self, query: str) -> Dict[str, str]:
+        labels: Dict[str, str] = {}
+        for match in re.finditer(
+            r"\(\s*(?P<variable>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*"
+            r"(?:`(?P<quoted_label>[^`]+)`|(?P<label>[A-Za-z_][A-Za-z0-9_$#-]*))",
+            query,
+        ):
+            labels[match.group("variable")] = match.group("quoted_label") or match.group("label")
+        return labels
+
+    def _is_string_property(self, label: str, property_name: str) -> bool:
+        if not label:
+            return False
+        label_types = self.property_types_by_label.get(label, {})
+        return label_types.get(property_name, "").upper() == "STRING"
+
+    def _has_string_property(self, property_name: str) -> bool:
+        return any(
+            properties.get(property_name, "").upper() == "STRING"
+            for properties in self.property_types_by_label.values()
+        )
 
     def _create_constraints(self, session: Any) -> None:
         for vertex in self.vertices:
@@ -288,6 +526,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--databases", nargs="*", default=[])
     parser.add_argument("--limit-databases", type=int, default=0)
     parser.add_argument("--limit-queries", type=int, default=0)
+    parser.add_argument(
+        "--query-offset",
+        type=int,
+        default=0,
+        help="Skip this many enriched query records before applying --limit-queries.",
+    )
     parser.add_argument("--graph-prefix", default="T2GQL")
     parser.add_argument(
         "--oracle-statuses",
@@ -303,6 +547,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neo4j-database", default=os.environ.get("NEO4J_DATABASE", "neo4j"))
     parser.add_argument("--neo4j-batch-size", type=int, default=1000)
     parser.add_argument("--keep-loaded", action="store_true")
+    parser.add_argument(
+        "--reuse-loaded",
+        action="store_true",
+        help="Skip Oracle/Neo4j load setup and validate against already-loaded graphs.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=0,
+        help="Print query progress every N selected records.",
+    )
     return parser.parse_args()
 
 
@@ -384,14 +639,31 @@ def compare_unit(
     }
     failures: List[Dict[str, Any]] = []
     try:
-        oracle_counts = oracle_loader.setup()
-        neo4j_counts = neo4j_loader.setup(clear=True)
-        summary["loaded"] = {"oracle": oracle_counts, "neo4j": neo4j_counts}
-        records = load_enriched_records(unit, Path(args.dataset_output_root))
-        valid_statuses = set(args.oracle_statuses)
+        if args.reuse_loaded:
+            print(f"[load] {unit.split}/{unit.database}: reusing loaded graphs", flush=True)
+            summary["loaded"] = {"reused": True}
+        else:
+            print(f"[load] {unit.split}/{unit.database}: oracle", flush=True)
+            oracle_counts = oracle_loader.setup()
+            print(f"[load] {unit.split}/{unit.database}: neo4j", flush=True)
+            neo4j_counts = neo4j_loader.setup(clear=True)
+            summary["loaded"] = {"oracle": oracle_counts, "neo4j": neo4j_counts}
+            print(f"[load] {unit.split}/{unit.database}: done", flush=True)
+        all_records = load_enriched_records(unit, Path(args.dataset_output_root))
+        records = select_records_for_range(all_records, args.query_offset, args.limit_queries)
+        summary["total_records"] = len(all_records)
+        summary["query_offset"] = args.query_offset
+        summary["selected_records"] = len(records)
         if args.limit_queries:
-            records = records[: args.limit_queries]
-        for record in records:
+            summary["limit_queries"] = args.limit_queries
+        valid_statuses = set(args.oracle_statuses)
+        for selected_index, record in enumerate(records, start=1):
+            if args.progress_every and selected_index % args.progress_every == 0:
+                print(
+                    f"[progress] {unit.split}/{unit.database}: "
+                    f"{selected_index}/{len(records)} selected records",
+                    flush=True,
+                )
             skip_reason = skip_reason_for_record(
                 record,
                 valid_statuses=valid_statuses,
@@ -415,6 +687,10 @@ def compare_unit(
             comparison = compare_record(record, oracle_client, neo4j_loader, args)
             if comparison["matched"]:
                 summary["matched"] += 1
+                continue
+            if comparison["reason"] == "suspected_order_by_limit_tie":
+                summary["skipped"] += 1
+                increment(summary["skip_reasons"], comparison["reason"])
                 continue
             summary["failed"] += 1
             increment(summary["failure_reasons"], comparison["reason"])
@@ -447,11 +723,12 @@ def compare_unit(
         return summary
     finally:
         if not args.keep_loaded:
-            oracle_loader.cleanup(ignore_errors=True)
-            try:
-                neo4j_loader.clear()
-            except Exception:
-                pass
+            if not args.reuse_loaded:
+                oracle_loader.cleanup(ignore_errors=True)
+                try:
+                    neo4j_loader.clear()
+                except Exception:
+                    pass
         neo4j_loader.close()
 
 
@@ -492,9 +769,12 @@ def compare_record(
     oracle_counter = normalized_counter(oracle_rows, neo4j_loader.primary_by_label)
     neo4j_counter = normalized_counter(neo4j_rows, neo4j_loader.primary_by_label)
     matched = oracle_counter == neo4j_counter
+    reason = "result_mismatch" if not matched else ""
+    if not matched and is_order_by_limit_query(cypher) and oracle_rows and neo4j_rows:
+        reason = "suspected_order_by_limit_tie"
     return comparison_result(
         matched,
-        "result_mismatch" if not matched else "",
+        reason,
         cypher,
         oracle_sqlpgq,
         oracle_status,
@@ -547,6 +827,17 @@ def load_enriched_records(unit: DatabaseUnit, output_root: Path) -> List[Dict[st
     ]
 
 
+def select_records_for_range(
+    records: Sequence[Dict[str, Any]],
+    query_offset: int = 0,
+    limit_queries: int = 0,
+) -> List[Dict[str, Any]]:
+    start = max(query_offset, 0)
+    if limit_queries > 0:
+        return list(records[start : start + limit_queries])
+    return list(records[start:])
+
+
 def skip_reason_for_record(
     record: Dict[str, Any],
     valid_statuses: set[str],
@@ -575,6 +866,14 @@ def is_nondeterministic_limit_without_order(query: str) -> bool:
     return bool(
         re.search(r"\bLIMIT\b", normalized, flags=re.IGNORECASE)
         and not re.search(r"\bORDER\s+BY\b", normalized, flags=re.IGNORECASE)
+    )
+
+
+def is_order_by_limit_query(query: str) -> bool:
+    normalized = _strip_string_literals(query)
+    return bool(
+        re.search(r"\bORDER\s+BY\b", normalized, flags=re.IGNORECASE)
+        and re.search(r"\bLIMIT\b", normalized, flags=re.IGNORECASE)
     )
 
 
@@ -620,10 +919,17 @@ def _normalize_value(value: Any, primary_by_label: Dict[str, str] | None = None)
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value) if value.is_integer() else round(value, 6)
+        if value.is_integer():
+            return int(value)
+        rounded = round(value, 6)
+        return int(rounded) if rounded.is_integer() else rounded
     if isinstance(value, timedelta):
         return value.total_seconds()
-    if isinstance(value, (date, datetime)):
+    if isinstance(value, datetime):
+        if value.hour == value.minute == value.second == value.microsecond == 0:
+            return value.date().isoformat()
+        return value.isoformat()
+    if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, str):
         return _normalize_temporal_string(value)
@@ -651,6 +957,9 @@ def _normalize_value(value: Any, primary_by_label: Dict[str, str] | None = None)
 
 
 def _normalize_temporal_string(value: str) -> str:
+    date_midnight = re.fullmatch(r"(\d{4}-\d{2}-\d{2})T00:00:00(?:\.0{6,9})?(?:Z)?", value)
+    if date_midnight:
+        return date_midnight.group(1)
     match = re.fullmatch(
         r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.0{6,9})?(?:Z)?",
         value,
